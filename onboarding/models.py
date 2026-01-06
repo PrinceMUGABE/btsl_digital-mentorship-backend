@@ -1,0 +1,506 @@
+from django.db import models
+from django.utils.timezone import now
+from django.db.models import Avg, Sum
+from userApp.models import CustomUser
+
+
+class OnboardingModule(models.Model):
+    MODULE_TYPES = [
+        ('core', 'Core'),
+        ('department', 'Department-Specific'),
+    ]
+    
+    title = models.CharField(max_length=200)
+    description = models.TextField()
+    module_type = models.CharField(max_length=20, choices=MODULE_TYPES, default='core')
+    department = models.CharField(max_length=100, blank=True, null=True)
+    order = models.IntegerField(default=0)
+    is_required = models.BooleanField(default=True)
+    duration_minutes = models.IntegerField(default=30, help_text="Estimated completion time in minutes")
+    content = models.JSONField(default=list, help_text="List of topics/sections")
+    resources = models.JSONField(default=list, help_text="Links to documents, videos, etc.")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        CustomUser, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        related_name='created_modules'
+    )
+    
+    class Meta:
+        ordering = ['order', 'created_at']
+        verbose_name = 'Onboarding Module'
+        verbose_name_plural = 'Onboarding Modules'
+        indexes = [
+            models.Index(fields=['module_type', 'department']),
+            models.Index(fields=['is_active']),
+        ]
+    
+    def __str__(self):
+        dept_suffix = f" - {self.department}" if self.department else ""
+        return f"{self.title} ({self.module_type}){dept_suffix}"
+    
+    def get_applicable_departments(self):
+        """Get list of departments this module applies to"""
+        if self.module_type == 'core':
+            return 'All Departments'
+        return self.department or 'Not Specified'
+    
+    def calculate_days_to_complete(self):
+        """Calculate estimated days to complete based on duration"""
+        # Assuming 4 hours per day for onboarding
+        hours_per_day = 4
+        total_hours = self.duration_minutes / 60
+        return round(total_hours / hours_per_day, 1)
+    
+    def get_completion_rate(self):
+        """Get completion rate for this module"""
+        total_assigned = self.mentee_progress.count()
+        if total_assigned == 0:
+            return 0
+        
+        completed = self.mentee_progress.filter(status='completed').count()
+        return round((completed / total_assigned) * 100, 2)
+    
+    def get_average_time_to_complete(self):
+        """Get average time taken by mentees to complete this module"""
+        completed_progress = self.mentee_progress.filter(
+            status='completed',
+            time_spent_minutes__gt=0
+        )
+        
+        if completed_progress.exists():
+            avg_time = completed_progress.aggregate(
+                avg_time=Avg('time_spent_minutes')
+            )['avg_time']
+            return round(avg_time, 1)
+        return None
+
+
+class MenteeOnboardingProgress(models.Model):
+    STATUS_CHOICES = [
+        ('not_started', 'Not Started'),
+        ('in_progress', 'In Progress'),
+        ('completed', 'Completed'),
+        ('overdue', 'Overdue'),
+        ('paused', 'Paused'),
+        ('needs_attention', 'Needs Attention'),
+        ('off_track', 'Off Track'),
+    ]
+    
+    mentee = models.ForeignKey(
+        CustomUser, 
+        on_delete=models.CASCADE, 
+        limit_choices_to={'role': 'mentee'},
+        related_name='onboarding_progress'
+    )
+    module = models.ForeignKey(
+        OnboardingModule, 
+        on_delete=models.CASCADE,
+        related_name='mentee_progress'
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='not_started')
+    progress_percentage = models.IntegerField(default=0)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    due_date = models.DateTimeField(null=True, blank=True, help_text="Expected completion date")
+    notes = models.TextField(blank=True, null=True, help_text="Mentee notes or feedback")
+    time_spent_minutes = models.IntegerField(default=0, help_text="Time spent on this module")
+    last_updated = models.DateTimeField(auto_now=True)
+    assigned_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='assigned_onboarding_modules',
+        help_text="User who assigned this module"
+    )
+    assigned_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ['mentee', 'module']
+        ordering = ['module__order']
+        verbose_name = 'Mentee Onboarding Progress'
+        verbose_name_plural = 'Mentee Onboarding Progress'
+        indexes = [
+            models.Index(fields=['mentee', 'status']),
+            models.Index(fields=['status']),
+            models.Index(fields=['due_date']),
+        ]
+    
+    def __str__(self):
+        return f"{self.mentee.full_name} - {self.module.title} ({self.status})"
+    
+    def save(self, *args, **kwargs):
+        """Override save to set due date when started and auto-calculate status"""
+        is_new = self.pk is None
+        
+        if self.started_at and not self.due_date:
+            # Set due date to 2 weeks from start date
+            from datetime import timedelta
+            self.due_date = self.started_at + timedelta(days=14)
+        
+        # Auto-calculate status based on progress if not completed
+        if self.status != 'completed' and not is_new:
+            self.status = self.calculate_auto_status()
+        
+        super().save(*args, **kwargs)
+    
+    def calculate_auto_status(self):
+        """Automatically calculate status based on progress and time"""
+        if self.progress_percentage == 100:
+            return 'completed'
+        
+        if self.progress_percentage == 0 and not self.started_at:
+            return 'not_started'
+        
+        if self.progress_percentage > 0:
+            if self.started_at:
+                from datetime import timedelta
+                days_since_start = (now() - self.started_at).days
+                
+                # Check for overdue
+                if self.due_date and now() > self.due_date:
+                    return 'overdue'
+                
+                # Check for off-track (very slow progress)
+                if days_since_start >= 7 and self.progress_percentage < 30:
+                    return 'off_track'
+                
+                # Check for needs attention (slow progress)
+                if days_since_start >= 3 and self.progress_percentage < 50:
+                    return 'needs_attention'
+                
+                return 'in_progress'
+        
+        return self.status
+    
+    def mark_as_started(self):
+        """Mark module as started"""
+        if self.status == 'not_started':
+            self.status = 'in_progress'
+            self.started_at = now()
+            self.save()
+    
+    def mark_as_completed(self):
+        """Mark module as completed"""
+        if self.status != 'completed':
+            self.status = 'completed'
+            self.progress_percentage = 100
+            self.completed_at = now()
+            self.save()
+    
+    def mark_as_paused(self):
+        """Mark module as paused"""
+        self.status = 'paused'
+        self.save()
+    
+    def mark_as_needs_attention(self):
+        """Mark module as needs attention"""
+        self.status = 'needs_attention'
+        self.save()
+    
+    def mark_as_off_track(self):
+        """Mark module as off track"""
+        self.status = 'off_track'
+        self.save()
+    
+    def update_progress(self, percentage):
+        """Update progress percentage"""
+        if 0 <= percentage <= 100:
+            self.progress_percentage = percentage
+            
+            # Auto-start if progress > 0 and not started
+            if percentage > 0 and self.status == 'not_started':
+                self.mark_as_started()
+            
+            # Auto-complete if 100%
+            if percentage == 100:
+                self.mark_as_completed()
+            else:
+                self.save()
+    
+    def update_time_spent(self, minutes):
+        """Update time spent on this module"""
+        if minutes >= 0:
+            self.time_spent_minutes = minutes
+            self.save()
+    
+    def add_time_spent(self, minutes):
+        """Add time spent on this module"""
+        if minutes > 0:
+            self.time_spent_minutes += minutes
+            self.save()
+    
+    def get_days_remaining(self):
+        """Calculate days remaining until due date"""
+        if self.due_date and not self.completed_at:
+            from datetime import timedelta
+            remaining = self.due_date - now()
+            if remaining.days < 0:
+                return 0
+            return remaining.days
+        return None
+    
+    def get_hours_remaining(self):
+        """Calculate hours remaining based on module duration"""
+        remaining_percentage = 100 - self.progress_percentage
+        remaining_minutes = (remaining_percentage / 100) * self.module.duration_minutes
+        return round(remaining_minutes / 60, 1)
+    
+    def is_overdue(self):
+        """Check if the module is overdue"""
+        if self.due_date and not self.completed_at:
+            return now() > self.due_date
+        return False
+    
+    def get_progress_speed(self):
+        """Calculate progress speed (percentage per day)"""
+        if self.started_at and self.progress_percentage > 0:
+            days_since_start = (now() - self.started_at).days
+            if days_since_start > 0:
+                return round(self.progress_percentage / days_since_start, 1)
+        return 0
+    
+    def is_on_track(self):
+        """Check if progress is on track based on time and percentage"""
+        if self.due_date and self.started_at:
+            total_days = (self.due_date - self.started_at).days
+            if total_days > 0:
+                expected_progress = (100 / total_days) * (now() - self.started_at).days
+                return self.progress_percentage >= expected_progress
+        return True
+
+
+class OnboardingChecklist(models.Model):
+    """Individual checklist items within a module"""
+    module = models.ForeignKey(
+        OnboardingModule, 
+        on_delete=models.CASCADE,
+        related_name='checklist_items'
+    )
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    order = models.IntegerField(default=0)
+    is_required = models.BooleanField(default=True)
+    estimated_minutes = models.IntegerField(default=15, help_text="Estimated time to complete this item")
+    
+    class Meta:
+        ordering = ['order']
+        verbose_name = 'Checklist Item'
+        verbose_name_plural = 'Checklist Items'
+        indexes = [
+            models.Index(fields=['module', 'order']),
+        ]
+    
+    def __str__(self):
+        return f"{self.module.title} - {self.title}"
+    
+    def get_completion_rate(self, mentee=None):
+        """Get completion rate for this checklist item"""
+        completions = self.mentee_completions.filter(is_completed=True)
+        
+        if mentee:
+            completions = completions.filter(mentee=mentee)
+            return completions.exists()  # Return boolean for specific mentee
+        
+        total_assigned = self.module.mentee_progress.count()
+        if total_assigned == 0:
+            return 0
+        
+        completed_count = completions.count()
+        return round((completed_count / total_assigned) * 100, 2)
+
+
+class MenteeChecklistProgress(models.Model):
+    """Track individual checklist item completion"""
+    mentee = models.ForeignKey(
+        CustomUser, 
+        on_delete=models.CASCADE,
+        related_name='checklist_progress'
+    )
+    checklist_item = models.ForeignKey(
+        OnboardingChecklist, 
+        on_delete=models.CASCADE,
+        related_name='mentee_completions'
+    )
+    is_completed = models.BooleanField(default=False)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    time_spent_minutes = models.IntegerField(default=0, help_text="Time spent on this checklist item")
+    notes = models.TextField(blank=True, null=True, help_text="Notes about this checklist item")
+    
+    class Meta:
+        unique_together = ['mentee', 'checklist_item']
+        verbose_name = 'Checklist Progress'
+        verbose_name_plural = 'Checklist Progress'
+        indexes = [
+            models.Index(fields=['mentee', 'is_completed']),
+            models.Index(fields=['checklist_item', 'is_completed']),
+        ]
+    
+    def __str__(self):
+        status = "Completed" if self.is_completed else "Not Completed"
+        return f"{self.mentee.full_name} - {self.checklist_item.title} ({status})"
+    
+    def mark_completed(self):
+        """Mark checklist item as completed"""
+        if not self.is_completed:
+            self.is_completed = True
+            self.completed_at = now()
+            self.save()
+    
+    def mark_incomplete(self):
+        """Mark checklist item as incomplete"""
+        self.is_completed = False
+        self.completed_at = None
+        self.save()
+    
+    def update_time_spent(self, minutes):
+        """Update time spent on this checklist item"""
+        if minutes >= 0:
+            self.time_spent_minutes = minutes
+            self.save()
+    
+    def add_time_spent(self, minutes):
+        """Add time spent on this checklist item"""
+        if minutes > 0:
+            self.time_spent_minutes += minutes
+            self.save()
+    
+    def get_completion_time(self):
+        """Get completion time in minutes"""
+        if self.completed_at and self.checklist_item.module:
+            # Find the module progress record
+            module_progress = MenteeOnboardingProgress.objects.filter(
+                mentee=self.mentee,
+                module=self.checklist_item.module
+            ).first()
+            
+            if module_progress and module_progress.started_at:
+                time_to_complete = (self.completed_at - module_progress.started_at).total_seconds() / 60
+                return round(time_to_complete, 1)
+        return None
+
+
+class OnboardingNotification(models.Model):
+    """Track notifications sent for onboarding activities"""
+    NOTIFICATION_TYPES = [
+        ('module_assigned', 'Module Assigned'),
+        ('module_started', 'Module Started'),
+        ('module_completed', 'Module Completed'),
+        ('deadline_approaching', 'Deadline Approaching'),
+        ('status_changed', 'Status Changed'),
+        ('needs_attention', 'Needs Attention'),
+        ('off_track', 'Off Track'),
+        ('overdue', 'Overdue'),
+    ]
+    
+    recipient = models.ForeignKey(
+        CustomUser,
+        on_delete=models.CASCADE,
+        related_name='onboarding_notifications'
+    )
+    notification_type = models.CharField(max_length=50, choices=NOTIFICATION_TYPES)
+    title = models.CharField(max_length=200)
+    message = models.TextField()
+    related_module = models.ForeignKey(
+        OnboardingModule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='notifications'
+    )
+    related_progress = models.ForeignKey(
+        MenteeOnboardingProgress,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='notifications'
+    )
+    sent_at = models.DateTimeField(auto_now_add=True)
+    is_read = models.BooleanField(default=False)
+    read_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        ordering = ['-sent_at']
+        verbose_name = 'Onboarding Notification'
+        verbose_name_plural = 'Onboarding Notifications'
+        indexes = [
+            models.Index(fields=['recipient', 'is_read']),
+            models.Index(fields=['sent_at']),
+        ]
+    
+    def __str__(self):
+        return f"{self.recipient.full_name} - {self.notification_type} - {self.sent_at.strftime('%Y-%m-%d %H:%M')}"
+    
+    def mark_as_read(self):
+        """Mark notification as read"""
+        if not self.is_read:
+            self.is_read = True
+            self.read_at = now()
+            self.save()
+
+
+class OnboardingDeadline(models.Model):
+    """Track deadlines for onboarding modules"""
+    module = models.ForeignKey(
+        OnboardingModule,
+        on_delete=models.CASCADE,
+        related_name='deadlines'
+    )
+    mentee = models.ForeignKey(
+        CustomUser,
+        on_delete=models.CASCADE,
+        limit_choices_to={'role': 'mentee'},
+        related_name='onboarding_deadlines'
+    )
+    due_date = models.DateTimeField()
+    original_due_date = models.DateTimeField(help_text="Original due date before any extensions")
+    is_extended = models.BooleanField(default=False)
+    extension_reason = models.TextField(blank=True, null=True, help_text="Reason for extension")
+    extension_granted_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='granted_extensions'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        unique_together = ['module', 'mentee']
+        ordering = ['due_date']
+        verbose_name = 'Onboarding Deadline'
+        verbose_name_plural = 'Onboarding Deadlines'
+        indexes = [
+            models.Index(fields=['due_date']),
+            models.Index(fields=['mentee', 'due_date']),
+        ]
+    
+    def __str__(self):
+        status = "Extended" if self.is_extended else "Original"
+        return f"{self.mentee.full_name} - {self.module.title} ({status})"
+    
+    def is_overdue(self):
+        """Check if deadline is overdue"""
+        return now() > self.due_date
+    
+    def get_days_remaining(self):
+        """Get days remaining until deadline"""
+        remaining = self.due_date - now()
+        if remaining.days < 0:
+            return 0
+        return remaining.days
+    
+    def extend_deadline(self, new_due_date, reason=None, granted_by=None):
+        """Extend the deadline"""
+        self.is_extended = True
+        self.original_due_date = self.due_date
+        self.due_date = new_due_date
+        self.extension_reason = reason
+        self.extension_granted_by = granted_by
+        self.save()

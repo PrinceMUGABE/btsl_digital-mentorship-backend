@@ -1,0 +1,1040 @@
+# views.py
+
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.response import Response
+from rest_framework import status
+from django.core.mail import send_mail
+from django.db.utils import IntegrityError
+from django.contrib.auth.hashers import make_password, check_password
+from django.shortcuts import get_object_or_404
+from django.core.exceptions import ObjectDoesNotExist
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
+from .models import CustomUser
+from .serializers import CustomUserSerializer, ContactUsSerializer
+import re
+import random
+import string
+import logging
+import traceback
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# ==================== HELPER FUNCTIONS ====================
+
+def is_valid_password(password):
+    """Validate password complexity."""
+    try:
+        if len(password) < 8:
+            return "Password must be at least 8 characters long."
+        if not any(char.isdigit() for char in password):
+            return "Password must include at least one number."
+        if not any(char.isupper() for char in password):
+            return "Password must include at least one uppercase letter."
+        if not any(char.islower() for char in password):
+            return "Password must include at least one lowercase letter."
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+            return "Password must include at least one special character (!@#$%^&* etc.)."
+        return None
+    except Exception as e:
+        error_msg = f"Error validating password: {str(e)}"
+        print(error_msg)
+        return "Error validating password format."
+
+def is_valid_email(email):
+    """Validate email format and domain."""
+    try:
+        email_regex = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+        
+        # Check format
+        if not re.match(email_regex, email):
+            return "Invalid email format."
+        
+        # Check if it's a Gmail for personal email
+        if not email.endswith("@gmail.com"):
+            return "Only Gmail addresses are allowed for personal email."
+        
+        return None
+    except Exception as e:
+        error_msg = f"Error validating email: {str(e)}"
+        print(error_msg)
+        return "Error validating email format."
+
+def is_valid_phone(phone_number):
+    """Validate phone number format."""
+    try:
+        # Remove spaces and check if it contains only digits and + sign
+        cleaned_phone = phone_number.replace(" ", "").replace("-", "")
+        if not cleaned_phone.startswith("+"):
+            return "Phone number must start with country code (e.g., +250)"
+        
+        # Check if remaining characters are digits
+        if not cleaned_phone[1:].isdigit():
+            return "Phone number must contain only digits after the country code."
+        
+        # Check length (international format typically 10-15 digits)
+        if len(cleaned_phone) < 10 or len(cleaned_phone) > 16:
+            return "Phone number must be between 10 and 15 digits (including country code)."
+        
+        return None
+    except Exception as e:
+        error_msg = f"Error validating phone number: {str(e)}"
+        print(error_msg)
+        return "Error validating phone number format."
+
+def generate_secure_password():
+    """Generate a secure random password that meets complexity requirements."""
+    try:
+        lowercase = string.ascii_lowercase
+        uppercase = string.ascii_uppercase
+        digits = string.digits
+        special_chars = "!@#$%^&*(),.?\":{}|<>"
+        
+        password = [
+            random.choice(lowercase),
+            random.choice(uppercase),
+            random.choice(digits),
+            random.choice(special_chars)
+        ]
+        
+        all_chars = lowercase + uppercase + digits + special_chars
+        password.extend(random.choice(all_chars) for _ in range(4))
+        
+        random.shuffle(password)
+        return ''.join(password)
+    except Exception as e:
+        error_msg = f"Error generating secure password: {str(e)}"
+        print(error_msg)
+        return None
+
+# ==================== AUTHENTICATION VIEWS ====================
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def register_user(request):
+    """Register user with role-based restrictions."""
+    try:
+        print(f"\n{'='*50}")
+        print(f"REGISTRATION REQUEST RECEIVED")
+        print(f"{'='*50}")
+        print(f"Submitted data: {request.data}\n")
+        
+        # Extract data
+        phone_number = request.data.get('phone_number', '').strip()
+        email = request.data.get('email', '').strip()
+        full_name = request.data.get('full_name', '').strip()
+        department = request.data.get('department', '').strip()
+        role = request.data.get('role', 'mentee').strip().lower()
+        requesting_user = request.user if request.user.is_authenticated else None
+        
+        # Validate required fields
+        if not phone_number:
+            error_msg = "Phone number is required."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if not email:
+            error_msg = "Email address is required."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if not full_name:
+            error_msg = "Full name is required."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if not department:
+            error_msg = "Department is required."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # Validate phone number format
+        phone_error = is_valid_phone(phone_number)
+        if phone_error:
+            print(f"ERROR: {phone_error}")
+            return Response({"error": phone_error}, status=400)
+        
+        # Validate email format
+        email_error = is_valid_email(email)
+        if email_error:
+            print(f"ERROR: {email_error}")
+            return Response({"error": email_error}, status=400)
+        
+        # Check role-based permissions
+        if role not in ['admin', 'mentor', 'mentee', 'hr']:
+            error_msg = f"Invalid role '{role}'. Must be one of: admin, mentor, mentee, hr"
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if role != 'mentee' and not requesting_user:
+            error_msg = "Only admin or HR can create users with roles other than 'mentee'."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if requesting_user:
+            if role == 'admin' and not requesting_user.is_admin:
+                error_msg = "Only admin can create admin users."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=403)
+            if role == 'hr' and not requesting_user.is_admin:
+                error_msg = "Only admin can create HR users."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=403)
+            if role == 'mentor' and not (requesting_user.is_admin or requesting_user.is_hr):
+                error_msg = "Only admin or HR can create mentor users."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=403)
+        
+        # Check for existing users
+        if CustomUser.objects.filter(phone_number=phone_number).exists():
+            error_msg = "A user with this phone number already exists."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if CustomUser.objects.filter(email=email).exists():
+            error_msg = "A user with this email already exists."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # Handle password
+        if requesting_user:
+            # Admin/HR creating user - generate password
+            password = generate_secure_password()
+            if not password:
+                error_msg = "Failed to generate secure password. Please try again."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=500)
+        else:
+            # User self-registering - validate provided password
+            password = request.data.get('password', '').strip()
+            confirm_password = request.data.get('confirm_password', '').strip()
+            
+            if not password:
+                error_msg = "Password is required."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            if not confirm_password:
+                error_msg = "Password confirmation is required."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            if password != confirm_password:
+                error_msg = "Passwords do not match."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            password_error = is_valid_password(password)
+            if password_error:
+                print(f"ERROR: {password_error}")
+                return Response({"error": password_error}, status=400)
+        
+        # Generate work mail address - FIX: Pass role parameter
+        try:
+            work_mail_address = CustomUser.objects.generate_work_mail(full_name, role)
+            print(f"Generated work email: {work_mail_address}")
+        except Exception as e:
+            error_msg = f"Failed to generate work email address: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            print(traceback.format_exc())
+            return Response({"error": "Failed to generate work email address. Please try again."}, status=500)
+        
+        # Create user
+        try:
+            user = CustomUser.objects.create_user(
+                phone_number=phone_number,
+                email=email,
+                full_name=full_name,
+                department=department,
+                role=role,
+                work_mail_address=work_mail_address,
+                password=password,
+                created_by=requesting_user,
+                status='approved' if requesting_user else 'pending',
+                availability_status='active' if requesting_user else 'inactive'
+            )
+            print(f"SUCCESS: User created with ID: {user.id}")
+            print(f"User details: {user.full_name} - {user.work_mail_address}")
+        except IntegrityError as e:
+            error_msg = f"Database integrity error: A user with this information already exists."
+            print(f"ERROR: {error_msg}")
+            print(f"IntegrityError details: {str(e)}")
+            return Response({"error": "A user with this information already exists."}, status=400)
+        except Exception as e:
+            error_msg = f"Error creating user: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            print(traceback.format_exc())
+            return Response({"error": "Failed to create user account. Please try again."}, status=500)
+        
+        # Send email with credentials
+        try:
+            subject = "Welcome to BTSL Mentorship System"
+            message = f"""
+Hello {full_name},
+
+Your account has been successfully created in the BTSL Mentorship System.
+
+Account Details:
+- Full Name: {full_name}
+- Role: {role.title()}
+- Department: {department}
+- Work Email: {work_mail_address}
+- Personal Email: {email}
+- Password: {password}
+
+Please use your work email ({work_mail_address}) to log in to the system.
+
+Important: This is a system-generated password. For security reasons, please change it after your first login.
+
+If you have any questions, please contact our support team.
+
+Best regards,
+BTSL Mentorship Team
+            """
+            
+            send_mail(
+                subject=subject,
+                message=message,
+                from_email="no-reply@btsl_mentorship.com",
+                recipient_list=[email],
+                fail_silently=False,
+            )
+            print(f"SUCCESS: Email sent to {email}")
+        except Exception as e:
+            # Don't fail registration if email fails
+            error_msg = f"Warning: User created but email failed to send: {str(e)}"
+            print(f"WARNING: {error_msg}")
+        
+        success_msg = "User registered successfully. Please check your email for login credentials."
+        print(f"SUCCESS: {success_msg}")
+        print(f"{'='*50}\n")
+        
+        return Response({
+            "message": success_msg,
+            "work_mail_address": work_mail_address,
+            "status": user.status,
+            "role": user.role
+        }, status=201)
+        
+    except Exception as e:
+        error_msg = f"Unexpected error during registration: {str(e)}"
+        print(f"CRITICAL ERROR: {error_msg}")
+        print(traceback.format_exc())
+        return Response({
+            "error": "An unexpected error occurred during registration. Please try again or contact support."
+        }, status=500)
+
+
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def login_user(request):
+    """Login user with  work mail."""
+    try:
+        print(f"\n{'='*50}")
+        print(f"LOGIN REQUEST RECEIVED")
+        print(f"{'='*50}")
+        
+        identifier = request.data.get('work_mail_address', '').strip()
+        password = request.data.get('password', '').strip()
+        
+        print(f"Login attempt with identifier: {identifier}")
+        
+        if not identifier:
+            error_msg = "Email, phone number, or work email is required."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if not password:
+            error_msg = "Password is required."
+            print(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # Find user by phone, email, or work mail
+        user = (
+            # CustomUser.objects.filter(phone_number=identifier).first() or
+            # CustomUser.objects.filter(email=identifier).first() or
+            CustomUser.objects.filter(work_mail_address=identifier).first()
+        )
+        
+        if not user:
+            error_msg = "Invalid credentials. Please check your email and password."
+            print(f"ERROR: User not found with identifier: {identifier}")
+            return Response({"error": error_msg}, status=401)
+        
+        print(f"User found: {user.full_name} ({user.email})")
+        
+        if not check_password(password, user.password):
+            error_msg = "Invalid credentials. Please check your email and password."
+            print(f"ERROR: Invalid password for user: {user.email}")
+            return Response({"error": error_msg}, status=401)
+        
+        if not user.is_active:
+            error_msg = "Your account is inactive. Please contact the administrator."
+            print(f"ERROR: Inactive account: {user.email}")
+            return Response({"error": error_msg}, status=401)
+        
+        if user.status == 'pending':
+            error_msg = "Your account is pending approval. Please wait for administrator approval."
+            print(f"ERROR: Pending account: {user.email}")
+            return Response({"error": error_msg}, status=401)
+        
+        if user.status == 'rejected':
+            error_msg = "Your account has been rejected. Please contact the administrator for more information."
+            print(f"ERROR: Rejected account: {user.email}")
+            return Response({"error": error_msg}, status=401)
+        
+        # Generate tokens
+        try:
+            refresh = RefreshToken.for_user(user)
+            print(f"SUCCESS: Login successful for user: {user.email}")
+        except Exception as e:
+            error_msg = f"Error generating authentication token: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            return Response({"error": "Authentication error. Please try again."}, status=500)
+        
+        # Serialize user data
+        serializer = CustomUserSerializer(user)
+        
+        print(f"{'='*50}\n")
+        
+        return Response({
+            **serializer.data,
+            "token": {
+                "refresh": str(refresh),
+                "access": str(refresh.access_token),
+            },
+            "message": "Login successful."
+        }, status=200)
+        
+    except Exception as e:
+        error_msg = f"Unexpected error during login: {str(e)}"
+        print(f"CRITICAL ERROR: {error_msg}")
+        print(traceback.format_exc())
+        return Response({
+            "error": "An unexpected error occurred during login. Please try again."
+        }, status=500)
+
+
+# ==================== PASSWORD MANAGEMENT ====================
+
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_or_deactivate_user(request, user_id):
+    """Delete or deactivate user based on role."""
+    try:
+        target_user = CustomUser.objects.get(id=user_id)
+        current_user = request.user
+        
+        # Check permissions
+        if not current_user.is_admin:
+            if current_user.is_hr and target_user.role == 'admin':
+                return Response({"error": "HR cannot delete admin users."}, status=403)
+            if current_user.is_mentor and target_user.role in ['admin', 'hr']:
+                return Response({"error": "Mentors cannot delete admin or HR users."}, status=403)
+        
+        # Determine action based on roles
+        if current_user.is_admin:
+            # Admin can delete any user permanently
+            target_user.delete()
+            action = "deleted"
+        else:
+            # Non-admin users can only deactivate accounts
+            target_user.is_active = False
+            target_user.availability_status = 'inactive'
+            target_user.save()
+            action = "deactivated"
+        
+        return Response({"message": f"User {action} successfully."}, status=200)
+        
+    except ObjectDoesNotExist:
+        return Response({"error": "User not found."}, status=404)
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def update_user(request, user_id):
+    """Update user information (admin/HR only)."""
+    if not request.user.is_admin and not request.user.is_hr:
+        return Response({"error": "You are not authorized to update user information."}, status=403)
+    
+    phone_number = request.data.get('phone_number')
+    email = request.data.get('email')
+    full_name = request.data.get('full_name')
+    department = request.data.get('department')
+    role = request.data.get('role')
+    status = request.data.get('status')
+    availability_status = request.data.get('availability_status')
+    
+    # Validate required fields
+    if not phone_number or not email or not full_name or not department or not role:
+        return Response({"error": "All fields are required for updating a user."}, status=400)
+    
+    try:
+        user = CustomUser.objects.get(id=user_id)
+        
+        # Prevent changing work mail address
+        if 'work_mail_address' in request.data:
+            return Response({"error": "Work mail address cannot be changed."}, status=400)
+        
+        # Check if the phone number or email already exists, excluding the current user
+        if CustomUser.objects.filter(phone_number=phone_number).exclude(id=user_id).exists():
+            return Response({"error": "A user with this phone number already exists."}, status=400)
+        
+        if CustomUser.objects.filter(email=email).exclude(id=user_id).exists():
+            return Response({"error": "A user with this email already exists."}, status=400)
+        
+        # Update user fields
+        user.phone_number = phone_number
+        user.email = email
+        user.full_name = full_name
+        user.department = department
+        user.role = role
+        user.status = status
+        user.availability_status = availability_status
+        user.save()
+        
+        serializer = CustomUserSerializer(user)
+        return Response({
+            "message": "User updated successfully.",
+            "user": serializer.data
+        }, status=200)
+        
+    except ObjectDoesNotExist:
+        return Response({"error": "User with the given ID does not exist."}, status=404)
+    except Exception as e:
+        return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=500)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_all_users(request):
+    """List all users with proper permissions."""
+    if not request.user.is_admin and not request.user.is_hr:
+        return Response({"error": "You are not authorized to view all users."}, status=403)
+    
+    users = CustomUser.objects.all()
+    serializer = CustomUserSerializer(users, many=True)
+    return Response({"users": serializer.data}, status=200)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_user_by_id(request, user_id):
+    """Get user by ID."""
+    try:
+        user = CustomUser.objects.get(id=user_id)
+        serializer = CustomUserSerializer(user)
+        return Response(serializer.data, status=200)
+    except ObjectDoesNotExist:
+        return Response({"error": "User with the given ID does not exist."}, status=404)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_user_by_email(request):
+    """Get user by email."""
+    email = request.query_params.get('email')
+    
+    if not email:
+        return Response({"error": "Email is required to search for a user."}, status=400)
+    
+    try:
+        user = CustomUser.objects.get(email=email)
+        
+        # Check permissions - users can only view their own profile unless admin/HR
+        if not request.user.is_admin and not request.user.is_hr and request.user.email != email:
+            return Response({"error": "You are not authorized to access this user."}, status=403)
+        
+        serializer = CustomUserSerializer(user)
+        return Response(serializer.data, status=200)
+    except ObjectDoesNotExist:
+        return Response({"error": "User with the given email does not exist."}, status=404)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_user_by_phone(request):
+    """Get user by phone number."""
+    phone_number = request.query_params.get('phone_number')
+    
+    if not phone_number:
+        return Response({"error": "Phone number is required to search for a user."}, status=400)
+    
+    try:
+        user = CustomUser.objects.get(phone_number=phone_number)
+        
+        # Check permissions - users can only view their own profile unless admin/HR
+        if not request.user.is_admin and not request.user.is_hr and request.user.phone_number != phone_number:
+            return Response({"error": "You are not authorized to access this user."}, status=403)
+        
+        serializer = CustomUserSerializer(user)
+        return Response(serializer.data, status=200)
+    except ObjectDoesNotExist:
+        return Response({"error": "User with the given phone number does not exist."}, status=404)
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def activate_user(request, user_id):
+    """Activate user account."""
+    try:
+        # Check permissions
+        if not request.user.is_admin and not request.user.is_hr:
+            return Response({"error": "You are not authorized to activate users."}, status=403)
+        
+        user = get_object_or_404(CustomUser, id=user_id)
+        
+        # Check if the user is already active
+        if user.status == 'approved':
+            return Response({"message": "This user account is already activated."}, status=400)
+        
+        # Activate the user
+        user.status = 'approved'
+        user.is_active = True
+        user.availability_status = 'active'
+        user.save()
+        
+        # Send notification email
+        send_mail(
+            subject="Account Activated - BTSL Mentorship",
+            message=f"Your account has been activated. You can now log in using your work email: {user.work_mail_address}",
+            from_email="no-reply@btsl_mentorship.com",
+            recipient_list=[user.email],
+        )
+        
+        return Response({"message": "User activated successfully."}, status=200)
+        
+    except Exception as e:
+        return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=500)
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def deactivate_user(request, user_id):
+    """Deactivate user account."""
+    try:
+        # Check permissions
+        if not request.user.is_admin and not request.user.is_hr:
+            return Response({"error": "You are not authorized to deactivate users."}, status=403)
+        
+        user = get_object_or_404(CustomUser, id=user_id)
+        
+        # Check if the user is already deactivated
+        if user.status != 'approved':
+            return Response({"message": "This user account is already deactivated."}, status=400)
+        
+        # Deactivate the user
+        user.status = 'rejected'
+        user.is_active = False
+        user.availability_status = 'inactive'
+        user.save()
+        
+        return Response({"message": "User deactivated successfully."}, status=200)
+        
+    except Exception as e:
+        return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=500)
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def update_user_status(request, user_id):
+    """Admin/HR can update user status."""
+    if not request.user.is_admin and not request.user.is_hr:
+        return Response({"error": "You are not authorized to update user status."}, status=403)
+    
+    try:
+        target_user = CustomUser.objects.get(id=user_id)
+        new_status = request.data.get('status')
+        
+        if new_status not in ['pending', 'approved', 'rejected']:
+            return Response({"error": "Invalid status value."}, status=400)
+        
+        target_user.status = new_status
+        
+        if new_status == 'approved':
+            target_user.availability_status = 'active'
+            target_user.is_active = True
+        else:
+            target_user.availability_status = 'inactive'
+            target_user.is_active = False
+        
+        target_user.save()
+        
+        # Send notification email
+        if new_status == 'approved':
+            send_mail(
+                subject="Account Approved - BTSL Mentorship",
+                message=f"Your account has been approved. You can now log in using your work email: {target_user.work_mail_address}",
+                from_email="no-reply@btsl_mentorship.com",
+                recipient_list=[target_user.email],
+            )
+        
+        serializer = CustomUserSerializer(target_user)
+        return Response({
+            "message": f"User status updated to {new_status}.",
+            "user": serializer.data
+        }, status=200)
+        
+    except ObjectDoesNotExist:
+        return Response({"error": "User not found."}, status=404)
+
+# ==================== PROFILE MANAGEMENT ====================
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_current_user(request):
+    """Get logged-in user's information."""
+    serializer = CustomUserSerializer(request.user)
+    return Response(serializer.data, status=200)
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def update_profile(request):
+    """Update user's own profile."""
+    user = request.user
+    
+    # Prevent changing work mail address
+    if 'work_mail_address' in request.data:
+        return Response({"error": "Work mail address cannot be changed."}, status=400)
+    
+    # Prevent changing role
+    if 'role' in request.data:
+        return Response({"error": "Role cannot be changed."}, status=400)
+    
+    # Update allowed fields
+    allowed_fields = ['phone_number', 'email', 'full_name', 'department', 'availability_status']
+    
+    for field in allowed_fields:
+        if field in request.data:
+            setattr(user, field, request.data[field])
+    
+    try:
+        # Check for duplicate phone number or email
+        if 'phone_number' in request.data:
+            if CustomUser.objects.filter(phone_number=request.data['phone_number']).exclude(id=user.id).exists():
+                return Response({"error": "Phone number already exists."}, status=400)
+        
+        if 'email' in request.data:
+            if CustomUser.objects.filter(email=request.data['email']).exclude(id=user.id).exists():
+                return Response({"error": "Email already exists."}, status=400)
+        
+        user.save()
+        serializer = CustomUserSerializer(user)
+        return Response({
+            "message": "Profile updated successfully.",
+            "user": serializer.data
+        }, status=200)
+    except IntegrityError as e:
+        return Response({"error": "Update failed due to data conflict."}, status=400)
+    except Exception as e:
+        return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=500)
+
+# ==================== CONTACT US ====================
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def contact_us(request):
+    """Handle contact us form submission."""
+    logger.info("Received contact request with data: %s", request.data)
+    
+    serializer = ContactUsSerializer(data=request.data)
+    
+    if serializer.is_valid():
+        names = serializer.validated_data['names']
+        email = serializer.validated_data['email']
+        subject = serializer.validated_data['subject']
+        description = serializer.validated_data['description']
+        
+        # Check for empty fields
+        if not names.strip():
+            logger.error("Name field is empty.")
+            return Response({"error": "Name field cannot be empty."}, status=status.HTTP_400_BAD_REQUEST)
+        if not subject.strip():
+            logger.error("Subject field is empty.")
+            return Response({"error": "Subject field cannot be empty."}, status=status.HTTP_400_BAD_REQUEST)
+        if not description.strip():
+            logger.error("Description field is empty.")
+            return Response({"error": "Description field cannot be empty."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate email format
+        try:
+            validate_email(email)
+        except ValidationError:
+            logger.error("Invalid email format: %s", email)
+            return Response({"error": "Invalid email format."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Sending email
+        try:
+            send_mail(
+                subject=f"Contact Us: {subject}",
+                message=f"Name: {names}\nEmail: {email}\n\nDescription:\n{description}",
+                from_email=email,
+                recipient_list=['princemugabe568@gmail.com'],
+                fail_silently=False,
+            )
+            logger.info("Email sent successfully to %s", email)
+            return Response({"message": "Email sent successfully."}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception("An error occurred while sending email: %s", e)
+            return Response({"error": "Failed to send email."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    logger.error("Invalid serializer data: %s", serializer.errors)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+
+
+
+import traceback
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from django.core.mail import send_mail
+from django.conf import settings
+from .models import CustomUser
+from .utils import generate_otp, store_otp, verify_otp, send_otp_email
+import logging
+
+logger = logging.getLogger(__name__)
+
+def is_valid_password(password):
+    """Validate password complexity."""
+    try:
+        if len(password) < 8:
+            return "Password must be at least 8 characters long."
+        if not any(char.isdigit() for char in password):
+            return "Password must include at least one number."
+        if not any(char.isupper() for char in password):
+            return "Password must include at least one uppercase letter."
+        if not any(char.islower() for char in password):
+            return "Password must include at least one lowercase letter."
+        import re
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+            return "Password must include at least one special character (!@#$%^&* etc.)."
+        return None
+    except Exception as e:
+        logger.error(f"Error validating password: {str(e)}")
+        return "Error validating password format."
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def request_password_reset_otp(request):
+    """Request OTP for password reset"""
+    try:
+        logger.info("\n" + "="*50)
+        logger.info("PASSWORD RESET OTP REQUEST")
+        logger.info("="*50)
+        
+        work_mail_address = request.data.get('work_mail_address', '').strip()
+        
+        if not work_mail_address:
+            error_msg = "Work email address is required."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # Check if user exists with this work email
+        try:
+            user = CustomUser.objects.get(work_mail_address=work_mail_address)
+            logger.info(f"User found: {user.full_name}")
+        except CustomUser.DoesNotExist:
+            error_msg = "No account found with this work email address."
+            logger.error(f"ERROR: {error_msg} - {work_mail_address}")
+            return Response({"error": error_msg}, status=404)
+        
+        # Check if user is active
+        if not user.is_active or user.status != 'approved':
+            error_msg = "Your account is not active. Please contact administrator."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # Generate OTP
+        otp = generate_otp(6)
+        logger.info(f"Generated OTP: {otp} for user: {work_mail_address}")
+        
+        # Store OTP in cache (expires in 30 seconds)
+        cache_key = store_otp(work_mail_address, otp, expiry_seconds=30)
+        logger.info(f"OTP stored with cache key: {cache_key}")
+        
+        # Send OTP via email
+        logger.info(f"Attempting to send OTP email to {user.email}...")
+        email_sent = send_otp_email(user, otp)
+        
+        if not email_sent:
+            error_msg = "Failed to send OTP email. Please try again."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=500)
+        
+        logger.info(f"SUCCESS: OTP sent to {user.email}")
+        logger.info("="*50 + "\n")
+        
+        return Response({
+            "message": "OTP has been sent to your registered email address.",
+            "work_mail_address": work_mail_address,
+            "email": user.email,  # For debugging
+            "expires_in": "30 seconds"
+        }, status=200)
+        
+    except Exception as e:
+        error_msg = f"Unexpected error during OTP request: {str(e)}"
+        logger.error(f"CRITICAL ERROR: {error_msg}")
+        logger.error(traceback.format_exc())
+        return Response({
+            "error": "An unexpected error occurred. Please try again.",
+            "detail": str(e)  # Include detail for debugging
+        }, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def verify_reset_otp(request):
+    """Verify OTP for password reset"""
+    try:
+        logger.info("\n" + "="*50)
+        logger.info("VERIFY RESET OTP")
+        logger.info("="*50)
+        
+        work_mail_address = request.data.get('work_mail_address', '').strip()
+        otp = request.data.get('otp', '').strip()
+        
+        if not work_mail_address:
+            error_msg = "Work email address is required."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if not otp:
+            error_msg = "OTP is required."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        logger.info(f"Verifying OTP for: {work_mail_address}")
+        
+        # Verify OTP
+        is_valid, message = verify_otp(work_mail_address, otp)
+        
+        if not is_valid:
+            logger.error(f"ERROR: OTP verification failed - {message}")
+            return Response({"error": message}, status=400)
+        
+        logger.info(f"SUCCESS: OTP verified for {work_mail_address}")
+        logger.info("="*50 + "\n")
+        
+        return Response({
+            "message": "OTP verified successfully. You can now reset your password.",
+            "verified": True,
+            "work_mail_address": work_mail_address
+        }, status=200)
+        
+    except Exception as e:
+        error_msg = f"Unexpected error during OTP verification: {str(e)}"
+        logger.error(f"CRITICAL ERROR: {error_msg}")
+        logger.error(traceback.format_exc())
+        return Response({
+            "error": "An unexpected error occurred. Please try again.",
+            "detail": str(e)
+        }, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def reset_password_with_otp(request):
+    """Reset password after OTP verification"""
+    try:
+        logger.info("\n" + "="*50)
+        logger.info("PASSWORD RESET WITH OTP")
+        logger.info("="*50)
+        
+        work_mail_address = request.data.get('work_mail_address', '').strip()
+        # otp = request.data.get('otp', '').strip()
+        new_password = request.data.get('new_password', '').strip()
+        confirm_password = request.data.get('confirm_password', '').strip()
+        
+        # Validate inputs
+        if not work_mail_address:
+            error_msg = "Work email address is required."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # if not otp:
+        #     error_msg = "OTP is required."
+        #     logger.error(f"ERROR: {error_msg}")
+        #     return Response({"error": error_msg}, status=400)
+        
+        if not new_password:
+            error_msg = "New password is required."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if not confirm_password:
+            error_msg = "Password confirmation is required."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        if new_password != confirm_password:
+            error_msg = "Passwords do not match."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # Validate password strength
+        password_error = is_valid_password(new_password)
+        if password_error:
+            logger.error(f"ERROR: {password_error}")
+            return Response({"error": password_error}, status=400)
+        
+        # Verify OTP one more time
+        # is_valid, message = verify_otp(work_mail_address, otp)
+        
+        # if not is_valid:
+        #     logger.error(f"ERROR: OTP verification failed - {message}")
+        #     return Response({"error": message}, status=400)
+        
+        # Get user
+        try:
+            user = CustomUser.objects.get(work_mail_address=work_mail_address)
+            logger.info(f"User found: {user.full_name}")
+        except CustomUser.DoesNotExist:
+            error_msg = "User not found."
+            logger.error(f"ERROR: {error_msg}")
+            return Response({"error": error_msg}, status=404)
+        
+        # Update password
+        user.set_password(new_password)
+        user.save()
+        logger.info(f"SUCCESS: Password updated for user: {work_mail_address}")
+        
+        # Send confirmation email
+        try:
+            send_mail(
+                subject="Password Reset Successful - BTSL Mentorship",
+                message=f"""
+Hello {user.full_name},
+
+Your password has been successfully reset for the BTSL Digital Mentorship System.
+
+If you did not perform this action, please contact our support team immediately.
+
+Best regards,
+BTSL Digital Mentorship Team
+                """,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+            logger.info(f"SUCCESS: Confirmation email sent to {user.email}")
+        except Exception as e:
+            logger.warning(f"WARNING: Password reset successful but email failed: {str(e)}")
+        
+        logger.info("="*50 + "\n")
+        
+        return Response({
+            "message": "Password reset successfully. You can now login with your new password.",
+            "success": True
+        }, status=200)
+        
+    except Exception as e:
+        error_msg = f"Unexpected error during password reset: {str(e)}"
+        logger.error(f"CRITICAL ERROR: {error_msg}")
+        logger.error(traceback.format_exc())
+        return Response({
+            "error": "An unexpected error occurred. Please try again.",
+            "detail": str(e)
+        }, status=500)

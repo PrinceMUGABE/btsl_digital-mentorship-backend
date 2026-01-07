@@ -30,14 +30,15 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
+    'channels',
     'userApp',
     'onboarding',
     'mentoshipApp',
-    # 'trainingCandidateApp',
-    # 'examApp',
-    # 'examResultApp',
-    # 'learningProgressApp',
-    # 'feedbackApp',
+    'departmentApp',
+    'chatApp',
+    'notificationApp',
+
+
     
 ]
 
@@ -80,7 +81,7 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'mysql.connector.django',
-        'NAME': 'teta',
+        'NAME': 'teta_db',
         'USER': 'root',
         'PASSWORD': '07288',
         'HOST': 'localhost',
@@ -234,6 +235,3 @@ CACHES = {
 OTP_EXPIRY_SECONDS = 30
 OTP_LENGTH = 6
 
-
-
-# EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'

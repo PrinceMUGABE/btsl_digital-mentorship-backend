@@ -2,7 +2,7 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
-    # Onboarding Modules
+    # Existing URLs...
     path('modules/', views.get_onboarding_modules, name='get-onboarding-modules'),
     path('modules/create/', views.create_onboarding_module, name='create-onboarding-module'),
     path('modules/<int:pk>/', views.get_onboarding_module_detail, name='get-onboarding-module-detail'),
@@ -10,10 +10,19 @@ urlpatterns = [
     path('modules/<int:pk>/delete/', views.delete_onboarding_module, name='delete-onboarding-module'),
     path('modules/statistics/', views.get_onboarding_statistics, name='get-onboarding-statistics'),
     path('modules/<int:pk>/assign/', views.assign_module_to_mentees, name='assign-module-to-mentees'),
+    path('modules/<int:pk>/department-assign/', views.assign_module_to_department, name='assign-module-to-department'),
     path('modules/<int:pk>/mentee-progress/', views.get_module_mentee_progress, name='get-module-mentee-progress'),
+    path('modules/by-department/', views.get_modules_by_department, name='get-modules-by-department'),
     path('modules/department/', views.get_department_modules, name='get-department-modules'),
     
-    # Mentee Progress
+    # New Department-focused URLs
+    path('departments/summary/', views.get_department_modules_summary, name='get-department-modules-summary'),
+    path('departments/<int:department_id>/progress/', views.get_department_progress_detail, name='get-department-progress-detail'),
+    path('departments/<int:department_id>/summary/', views.get_department_modules_summary, name='get-department-specific-summary'),
+    path('departments/comparison/', views.get_department_comparison, name='get-department-comparison'),
+    path('modules/<int:module_id>/department-performance/', views.get_department_module_performance, name='get-department-module-performance'),
+    
+    # Existing URLs for progress management...
     path('progress/', views.get_mentee_progress, name='get-mentee-progress'),
     path('progress/<int:pk>/', views.get_mentee_progress_detail, name='get-mentee-progress-detail'),
     path('progress/<int:pk>/start/', views.start_onboarding_module, name='start-onboarding-module'),

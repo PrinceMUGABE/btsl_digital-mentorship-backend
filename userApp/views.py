@@ -19,6 +19,7 @@ import random
 import string
 import logging
 import traceback
+from departmentApp.models import Department
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ def generate_secure_password():
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def register_user(request):
-    """Register user with role-based restrictions."""
+    """Register user with role-based department validation."""
     try:
         print(f"\n{'='*50}")
         print(f"REGISTRATION REQUEST RECEIVED")
@@ -127,6 +128,7 @@ def register_user(request):
         email = request.data.get('email', '').strip()
         full_name = request.data.get('full_name', '').strip()
         department = request.data.get('department', '').strip()
+        departments = request.data.get('departments', [])  # For mentors
         role = request.data.get('role', 'mentee').strip().lower()
         requesting_user = request.user if request.user.is_authenticated else None
         
@@ -143,11 +145,6 @@ def register_user(request):
         
         if not full_name:
             error_msg = "Full name is required."
-            print(f"ERROR: {error_msg}")
-            return Response({"error": error_msg}, status=400)
-        
-        if not department:
-            error_msg = "Department is required."
             print(f"ERROR: {error_msg}")
             return Response({"error": error_msg}, status=400)
         
@@ -169,6 +166,40 @@ def register_user(request):
             print(f"ERROR: {error_msg}")
             return Response({"error": error_msg}, status=400)
         
+        # Department validation based on role
+        if role == 'mentee':
+            if not department:
+                error_msg = "Department is required for mentee users."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            # Validate department exists and is active
+            try:
+                dept_obj = Department.objects.get(id=department, status='active')
+            except Department.DoesNotExist:
+                error_msg = "Invalid or inactive department selected."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+        
+        elif role == 'mentor':
+            if not departments or len(departments) == 0:
+                error_msg = "At least one department is required for mentor users."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            # Validate all departments exist and are active
+            valid_depts = Department.objects.filter(id__in=departments, status='active')
+            if valid_depts.count() != len(departments):
+                error_msg = "One or more selected departments are invalid or inactive."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+        
+        elif role in ['admin', 'hr']:
+            # Admin and HR don't require departments
+            department = None
+            departments = []
+        
+        # Role-based permission checks
         if role != 'mentee' and not requesting_user:
             error_msg = "Only admin or HR can create users with roles other than 'mentee'."
             print(f"ERROR: {error_msg}")
@@ -201,14 +232,12 @@ def register_user(request):
         
         # Handle password
         if requesting_user:
-            # Admin/HR creating user - generate password
             password = generate_secure_password()
             if not password:
                 error_msg = "Failed to generate secure password. Please try again."
                 print(f"ERROR: {error_msg}")
                 return Response({"error": error_msg}, status=500)
         else:
-            # User self-registering - validate provided password
             password = request.data.get('password', '').strip()
             confirm_password = request.data.get('confirm_password', '').strip()
             
@@ -232,7 +261,7 @@ def register_user(request):
                 print(f"ERROR: {password_error}")
                 return Response({"error": password_error}, status=400)
         
-        # Generate work mail address - FIX: Pass role parameter
+        # Generate work mail address
         try:
             work_mail_address = CustomUser.objects.generate_work_mail(full_name, role)
             print(f"Generated work email: {work_mail_address}")
@@ -244,11 +273,14 @@ def register_user(request):
         
         # Create user
         try:
+            # For mentee, pass department ID; for mentor, pass None (use M2M later)
+            dept_for_creation = department if role == 'mentee' else None
+            
             user = CustomUser.objects.create_user(
                 phone_number=phone_number,
                 email=email,
                 full_name=full_name,
-                department=department,
+                department=dept_for_creation,
                 role=role,
                 work_mail_address=work_mail_address,
                 password=password,
@@ -256,6 +288,12 @@ def register_user(request):
                 status='approved' if requesting_user else 'pending',
                 availability_status='active' if requesting_user else 'inactive'
             )
+            
+            # For mentors, set multiple departments
+            if role == 'mentor' and departments:
+                user.departments.set(departments)
+                print(f"Set {len(departments)} departments for mentor: {user.full_name}")
+            
             print(f"SUCCESS: User created with ID: {user.id}")
             print(f"User details: {user.full_name} - {user.work_mail_address}")
         except IntegrityError as e:
@@ -271,6 +309,16 @@ def register_user(request):
         
         # Send email with credentials
         try:
+            # Get department info for email
+            dept_info = ""
+            if role == 'mentee':
+                dept_info = f"Department: {user.department.name}"
+            elif role == 'mentor':
+                dept_names = [d.name for d in user.departments.all()]
+                dept_info = f"Departments: {', '.join(dept_names)}"
+            else:
+                dept_info = "Department: N/A (Admin/HR)"
+            
             subject = "Welcome to BTSL Mentorship System"
             message = f"""
 Hello {full_name},
@@ -280,7 +328,7 @@ Your account has been successfully created in the BTSL Mentorship System.
 Account Details:
 - Full Name: {full_name}
 - Role: {role.title()}
-- Department: {department}
+- {dept_info}
 - Work Email: {work_mail_address}
 - Personal Email: {email}
 - Password: {password}
@@ -304,7 +352,6 @@ BTSL Mentorship Team
             )
             print(f"SUCCESS: Email sent to {email}")
         except Exception as e:
-            # Don't fail registration if email fails
             error_msg = f"Warning: User created but email failed to send: {str(e)}"
             print(f"WARNING: {error_msg}")
         
@@ -328,11 +375,12 @@ BTSL Mentorship Team
         }, status=500)
 
 
+
 @api_view(['POST'])
 @authentication_classes([])
 @permission_classes([AllowAny])
 def login_user(request):
-    """Login user with  work mail."""
+    """Login user with work mail."""
     try:
         print(f"\n{'='*50}")
         print(f"LOGIN REQUEST RECEIVED")
@@ -344,7 +392,7 @@ def login_user(request):
         print(f"Login attempt with identifier: {identifier}")
         
         if not identifier:
-            error_msg = "Email, phone number, or work email is required."
+            error_msg = "Work email is required."
             print(f"ERROR: {error_msg}")
             return Response({"error": error_msg}, status=400)
         
@@ -353,12 +401,7 @@ def login_user(request):
             print(f"ERROR: {error_msg}")
             return Response({"error": error_msg}, status=400)
         
-        # Find user by phone, email, or work mail
-        user = (
-            # CustomUser.objects.filter(phone_number=identifier).first() or
-            # CustomUser.objects.filter(email=identifier).first() or
-            CustomUser.objects.filter(work_mail_address=identifier).first()
-        )
+        user = CustomUser.objects.filter(work_mail_address=identifier).first()
         
         if not user:
             error_msg = "Invalid credentials. Please check your email and password."
@@ -387,7 +430,6 @@ def login_user(request):
             print(f"ERROR: Rejected account: {user.email}")
             return Response({"error": error_msg}, status=401)
         
-        # Generate tokens
         try:
             refresh = RefreshToken.for_user(user)
             print(f"SUCCESS: Login successful for user: {user.email}")
@@ -396,7 +438,6 @@ def login_user(request):
             print(f"ERROR: {error_msg}")
             return Response({"error": "Authentication error. Please try again."}, status=500)
         
-        # Serialize user data
         serializer = CustomUserSerializer(user)
         
         print(f"{'='*50}\n")
@@ -418,9 +459,7 @@ def login_user(request):
             "error": "An unexpected error occurred during login. Please try again."
         }, status=500)
 
-
 # ==================== PASSWORD MANAGEMENT ====================
-
 
 
 @api_view(['DELETE'])
@@ -431,20 +470,16 @@ def delete_or_deactivate_user(request, user_id):
         target_user = CustomUser.objects.get(id=user_id)
         current_user = request.user
         
-        # Check permissions
         if not current_user.is_admin:
             if current_user.is_hr and target_user.role == 'admin':
                 return Response({"error": "HR cannot delete admin users."}, status=403)
             if current_user.is_mentor and target_user.role in ['admin', 'hr']:
                 return Response({"error": "Mentors cannot delete admin or HR users."}, status=403)
         
-        # Determine action based on roles
         if current_user.is_admin:
-            # Admin can delete any user permanently
             target_user.delete()
             action = "deleted"
         else:
-            # Non-admin users can only deactivate accounts
             target_user.is_active = False
             target_user.availability_status = 'inactive'
             target_user.save()
@@ -455,58 +490,134 @@ def delete_or_deactivate_user(request, user_id):
     except ObjectDoesNotExist:
         return Response({"error": "User not found."}, status=404)
 
+
+
 @api_view(['PUT'])
 @permission_classes([IsAuthenticated])
 def update_user(request, user_id):
-    """Update user information (admin/HR only)."""
+    """Update user information with department validation."""
     if not request.user.is_admin and not request.user.is_hr:
         return Response({"error": "You are not authorized to update user information."}, status=403)
     
-    phone_number = request.data.get('phone_number')
-    email = request.data.get('email')
-    full_name = request.data.get('full_name')
-    department = request.data.get('department')
-    role = request.data.get('role')
-    status = request.data.get('status')
-    availability_status = request.data.get('availability_status')
-    
-    # Validate required fields
-    if not phone_number or not email or not full_name or not department or not role:
-        return Response({"error": "All fields are required for updating a user."}, status=400)
-    
     try:
-        user = CustomUser.objects.get(id=user_id)
+        target_user = CustomUser.objects.get(id=user_id)
+        
+        phone_number = request.data.get('phone_number')
+        email = request.data.get('email')
+        full_name = request.data.get('full_name')
+        department = request.data.get('department')
+        departments = request.data.get('departments', [])
+        role = request.data.get('role')
+        status_val = request.data.get('status')
+        availability_status = request.data.get('availability_status')
+        
+        # Check if user can update departments
+        if ('department' in request.data or 'departments' in request.data):
+            if not request.user.can_update_departments():
+                print("ERROR: Only admin and HR users can update departments.")
+                return Response({
+                    "error": "Only admin and HR users can update departments."
+                }, status=403)
         
         # Prevent changing work mail address
         if 'work_mail_address' in request.data:
+            print("ERROR: Work mail address cannot be changed.")
             return Response({"error": "Work mail address cannot be changed."}, status=400)
         
-        # Check if the phone number or email already exists, excluding the current user
-        if CustomUser.objects.filter(phone_number=phone_number).exclude(id=user_id).exists():
+        # Validate uniqueness
+        if phone_number and CustomUser.objects.filter(phone_number=phone_number).exclude(id=user_id).exists():
+            print("ERROR: A user with this phone number already exists.")
             return Response({"error": "A user with this phone number already exists."}, status=400)
         
-        if CustomUser.objects.filter(email=email).exclude(id=user_id).exists():
+        if email and CustomUser.objects.filter(email=email).exclude(id=user_id).exists():
+            print("ERROR: A user with this email already exists.")
             return Response({"error": "A user with this email already exists."}, status=400)
         
-        # Update user fields
-        user.phone_number = phone_number
-        user.email = email
-        user.full_name = full_name
-        user.department = department
-        user.role = role
-        user.status = status
-        user.availability_status = availability_status
-        user.save()
+        # Role-based department validation
+        if role:
+            if role == 'mentee':
+                if not department:
+                    print("ERROR: Mentee users must have a department assigned.")
+                    return Response({
+                        "error": "Mentee users must have a department assigned."
+                    }, status=400)
+                
+                try:
+                    dept_obj = Department.objects.get(id=department, status='active')
+                    target_user.department = dept_obj
+                    target_user.departments.clear()  # Clear M2M if exists
+                except Department.DoesNotExist:
+                    print("ERROR: Invalid or inactive department selected.")
+                    return Response({
+                        "error": "Invalid or inactive department selected."
+                    }, status=400)
+            
+            elif role == 'mentor':
+                if not departments or len(departments) == 0:
+                    print("ERROR: Mentor users must have at least one department assigned.")
+                    return Response({
+                        "error": "Mentor users must have at least one department assigned."
+                    }, status=400)
+                
+                valid_depts = Department.objects.filter(id__in=departments, status='active')
+                if valid_depts.count() != len(departments):
+                    print("ERROR: One or more selected departments are invalid or inactive.")
+                    return Response({
+                        "error": "One or more selected departments are invalid or inactive."
+                    }, status=400)
+                
+                target_user.department = None  # Clear FK
+                # Don't call .set() until after save
+            
+            elif role in ['admin', 'hr']:
+                target_user.department = None
+                # Don't clear M2M until after save
+            
+            target_user.role = role
         
-        serializer = CustomUserSerializer(user)
+        # Update other fields
+        if phone_number:
+            target_user.phone_number = phone_number
+        if email:
+            target_user.email = email
+        if full_name:
+            target_user.full_name = full_name
+        if status_val:
+            target_user.status = status_val
+        if availability_status:
+            target_user.availability_status = availability_status
+        
+        # Save with skip_validation to avoid full_clean() issues
+        target_user.save(skip_validation=True)
+        
+        # Now update M2M relationships after save
+        if role == 'mentor' and departments:
+            target_user.departments.set(Department.objects.filter(id__in=departments, status='active'))
+            print(f"SUCCESS: Updated mentor with {len(departments)} departments")
+        elif role == 'mentee':
+            target_user.departments.clear()
+            print("SUCCESS: Cleared M2M departments for mentee")
+        elif role in ['admin', 'hr']:
+            target_user.departments.clear()
+            print("SUCCESS: Cleared departments for admin/hr")
+        
+        serializer = CustomUserSerializer(target_user)
+        print(f"SUCCESS: User {target_user.id} updated successfully")
         return Response({
             "message": "User updated successfully.",
             "user": serializer.data
         }, status=200)
         
     except ObjectDoesNotExist:
+        print("ERROR: User with the given ID does not exist.")
         return Response({"error": "User with the given ID does not exist."}, status=404)
+    except ValidationError as ve:
+        print(f"ERROR: Validation error: {str(ve)}")
+        return Response({"error": f"Validation error: {str(ve)}"}, status=400)
     except Exception as e:
+        print(f"ERROR: An unexpected error occurred: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
         return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=500)
 
 @api_view(['GET'])
@@ -520,6 +631,7 @@ def list_all_users(request):
     serializer = CustomUserSerializer(users, many=True)
     return Response({"users": serializer.data}, status=200)
 
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_user_by_id(request, user_id):
@@ -530,6 +642,7 @@ def get_user_by_id(request, user_id):
         return Response(serializer.data, status=200)
     except ObjectDoesNotExist:
         return Response({"error": "User with the given ID does not exist."}, status=404)
+
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -688,26 +801,27 @@ def get_current_user(request):
 @api_view(['PUT'])
 @permission_classes([IsAuthenticated])
 def update_profile(request):
-    """Update user's own profile."""
+    """Update user's own profile (cannot change departments)."""
     user = request.user
     
-    # Prevent changing work mail address
     if 'work_mail_address' in request.data:
         return Response({"error": "Work mail address cannot be changed."}, status=400)
     
-    # Prevent changing role
     if 'role' in request.data:
         return Response({"error": "Role cannot be changed."}, status=400)
     
-    # Update allowed fields
-    allowed_fields = ['phone_number', 'email', 'full_name', 'department', 'availability_status']
+    if 'department' in request.data or 'departments' in request.data:
+        return Response({
+            "error": "You cannot change your department(s). Please contact admin or HR."
+        }, status=403)
+    
+    allowed_fields = ['phone_number', 'email', 'full_name', 'availability_status']
     
     for field in allowed_fields:
         if field in request.data:
             setattr(user, field, request.data[field])
     
     try:
-        # Check for duplicate phone number or email
         if 'phone_number' in request.data:
             if CustomUser.objects.filter(phone_number=request.data['phone_number']).exclude(id=user.id).exists():
                 return Response({"error": "Phone number already exists."}, status=400)
@@ -722,10 +836,11 @@ def update_profile(request):
             "message": "Profile updated successfully.",
             "user": serializer.data
         }, status=200)
-    except IntegrityError as e:
+    except IntegrityError:
         return Response({"error": "Update failed due to data conflict."}, status=400)
     except Exception as e:
         return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=500)
+
 
 # ==================== CONTACT US ====================
 

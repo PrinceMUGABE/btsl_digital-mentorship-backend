@@ -276,38 +276,739 @@ def send_status_change_notification(progress, old_status, new_status):
             )
 
 
-# ================ ONBOARDING MODULE VIEWS ================
+
+
+
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+from django.shortcuts import get_object_or_404
+from django.db.models import Q, Avg, Count, Sum, F
+from django.utils.timezone import now, timedelta
+from django.db import transaction
+from collections import defaultdict
+
+from .models import (
+    OnboardingModule, 
+    MenteeOnboardingProgress, 
+    OnboardingChecklist,
+    MenteeChecklistProgress,
+    OnboardingNotification,
+    OnboardingDeadline
+)
+from .serializers import (
+    OnboardingModuleSerializer,
+    OnboardingModuleCreateSerializer,
+    MenteeOnboardingProgressSerializer,
+    DepartmentProgressSerializer,
+    DepartmentModuleStatsSerializer,
+    DepartmentSummarySerializer
+)
+from userApp.models import CustomUser
+from departmentApp.models import Department
+
+
+# ================ NEW DEPARTMENT-FOCUSED VIEWS ================
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_department_modules_summary(request, department_id=None):
+    """
+    Get summary of modules for a specific department or all departments
+    """
+    if request.user.role not in ['admin', 'hr', 'mentor']:
+        return Response(
+            {'error': 'Only admins, HR, and mentors can view department summaries'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    # If department_id is provided, get specific department
+    if department_id:
+        department = get_object_or_404(Department, id=department_id)
+        departments = [department]
+    else:
+        # Get all active departments
+        departments = Department.objects.filter(status='active')
+    
+    # If user is mentor, filter to their department only
+    if request.user.role == 'mentor':
+        departments = departments.filter(name=request.user.department)
+    
+    department_summaries = []
+    
+    for department in departments:
+        # Get all modules applicable to this department
+        modules = OnboardingModule.objects.filter(
+            Q(module_type='core') | Q(departments=department),
+            is_active=True
+        ).distinct()
+        
+        # Get mentees in this department
+        mentees = CustomUser.objects.filter(
+            role='mentee',
+            department=department.name,
+            status='approved'
+        )
+        
+        # Calculate statistics
+        total_mentees = mentees.count()
+        total_modules_assigned = MenteeOnboardingProgress.objects.filter(
+            mentee__department=department.name
+        ).count()
+        
+        # Calculate completion statistics
+        completed_modules = MenteeOnboardingProgress.objects.filter(
+            mentee__department=department.name,
+            status='completed'
+        ).count()
+        
+        overall_completion_rate = 0
+        if total_modules_assigned > 0:
+            overall_completion_rate = round((completed_modules / total_modules_assigned) * 100, 2)
+        
+        # Calculate average progress per mentee
+        if total_mentees > 0:
+            avg_progress = MenteeOnboardingProgress.objects.filter(
+                mentee__department=department.name
+            ).aggregate(
+                avg=Avg('progress_percentage')
+            )['avg'] or 0
+        else:
+            avg_progress = 0
+        
+        # Count mentees behind schedule
+        mentees_behind_schedule = CustomUser.objects.filter(
+            role='mentee',
+            department=department.name,
+            status='approved',
+            onboarding_progress__status__in=['overdue', 'off_track', 'needs_attention']
+        ).distinct().count()
+        
+        # Identify modules requiring attention
+        problem_modules = OnboardingModule.objects.filter(
+            Q(module_type='core') | Q(departments=department),
+            is_active=True,
+            mentee_progress__status__in=['overdue', 'off_track'],
+            mentee_progress__mentee__department=department.name
+        ).values_list('title', flat=True).distinct()[:5]
+        
+        department_summaries.append({
+            'department_id': department.id,
+            'department_name': department.name,
+            'total_mentees': total_mentees,
+            'total_modules_assigned': total_modules_assigned,
+            'completed_modules': completed_modules,
+            'overall_completion_rate': overall_completion_rate,
+            'average_progress_per_mentee': round(avg_progress, 2),
+            'mentees_behind_schedule': mentees_behind_schedule,
+            'modules_requiring_attention': list(problem_modules)
+        })
+    
+    serializer = DepartmentSummarySerializer(department_summaries, many=True)
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_department_progress_detail(request, department_id):
+    """
+    Get detailed progress for a specific department
+    """
+    department = get_object_or_404(Department, id=department_id)
+    
+    # Check permissions
+    if request.user.role == 'mentor' and department.name != request.user.department:
+        return Response(
+            {'error': 'You can only view progress for your own department'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    # Get mentees in this department
+    mentees = CustomUser.objects.filter(
+        role='mentee',
+        department=department.name,
+        status='approved'
+    )
+    
+    # Get all progress records for this department
+    progress_records = MenteeOnboardingProgress.objects.filter(
+        mentee__department=department.name
+    ).select_related('mentee', 'module')
+    
+    # Group by mentee
+    mentee_progress = {}
+    for mentee in mentees:
+        mentee_records = progress_records.filter(mentee=mentee)
+        total_modules = mentee_records.count()
+        completed_modules = mentee_records.filter(status='completed').count()
+        avg_progress = mentee_records.aggregate(
+            avg=Avg('progress_percentage')
+        )['avg'] or 0
+        
+        mentee_progress[mentee.id] = {
+            'mentee_id': mentee.id,
+            'mentee_name': mentee.full_name,
+            'mentee_email': mentee.email,
+            'total_modules': total_modules,
+            'completed_modules': completed_modules,
+            'in_progress_modules': mentee_records.filter(status='in_progress').count(),
+            'not_started_modules': mentee_records.filter(status='not_started').count(),
+            'average_progress': round(avg_progress, 2),
+            'is_behind_schedule': mentee_records.filter(
+                status__in=['overdue', 'off_track', 'needs_attention']
+            ).exists()
+        }
+    
+    # Group by module
+    modules = OnboardingModule.objects.filter(
+        Q(module_type='core') | Q(departments=department),
+        is_active=True
+    ).distinct()
+    
+    module_stats = []
+    for module in modules:
+        module_progress = progress_records.filter(module=module)
+        total_assigned = module_progress.count()
+        completed = module_progress.filter(status='completed').count()
+        
+        module_stats.append({
+            'module_id': module.id,
+            'module_title': module.title,
+            'module_type': module.module_type,
+            'total_assigned': total_assigned,
+            'completed': completed,
+            'completion_rate': round((completed / total_assigned * 100), 2) if total_assigned > 0 else 0,
+            'avg_time_spent': module_progress.aggregate(
+                avg=Avg('time_spent_minutes')
+            )['avg'] or 0,
+            'mentees_behind': module_progress.filter(
+                status__in=['overdue', 'off_track']
+            ).count()
+        })
+    
+    # Calculate department-wide statistics
+    total_mentees = mentees.count()
+    total_progress_records = progress_records.count()
+    total_completed = progress_records.filter(status='completed').count()
+    
+    return Response({
+        'department': {
+            'id': department.id,
+            'name': department.name,
+            'description': department.description,
+            'status': department.status
+        },
+        'summary': {
+            'total_mentees': total_mentees,
+            'total_modules_assigned': total_progress_records,
+            'total_completed': total_completed,
+            'overall_completion_rate': round((total_completed / total_progress_records * 100), 2) if total_progress_records > 0 else 0,
+            'average_progress_percentage': progress_records.aggregate(
+                avg=Avg('progress_percentage')
+            )['avg'] or 0,
+            'mentees_behind_schedule': len([m for m in mentee_progress.values() if m['is_behind_schedule']])
+        },
+        'mentee_progress': list(mentee_progress.values()),
+        'module_stats': module_stats
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_modules_by_department(request):
+    """
+    Get modules filtered by department(s)
+    """
+    user = request.user
+    department_ids = request.query_params.getlist('department_ids[]')
+    
+    queryset = OnboardingModule.objects.filter(is_active=True)
+    
+    # Filter by specific departments if provided
+    if department_ids:
+        try:
+            department_ids = [int(id) for id in department_ids]
+            queryset = queryset.filter(
+                Q(module_type='core') | Q(departments__id__in=department_ids)
+            ).distinct()
+        except ValueError:
+            return Response(
+                {'error': 'Invalid department IDs'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    else:
+        # If no department filter, show all modules
+        if user.role == 'mentee':
+            # For mentees, show modules for their department
+            queryset = queryset.filter(
+                Q(module_type='core') | Q(departments__name=user.department)
+            ).distinct()
+        elif user.role == 'mentor':
+            # For mentors, show modules for their department
+            queryset = queryset.filter(
+                Q(module_type='core') | Q(departments__name=user.department)
+            ).distinct()
+    
+    # Apply additional filters
+    module_type = request.query_params.get('module_type')
+    if module_type:
+        queryset = queryset.filter(module_type=module_type)
+    
+    serializer = OnboardingModuleSerializer(queryset, many=True)
+    return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def assign_module_to_department(request, pk):
+    """
+    Assign a module to all mentees in specific departments
+    """
+    if request.user.role not in ['admin', 'hr']:
+        return Response(
+            {'error': 'Only admins and HR can assign modules to departments'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    module = get_object_or_404(OnboardingModule, pk=pk, is_active=True)
+    department_ids = request.data.get('department_ids', [])
+    
+    if not department_ids:
+        return Response(
+            {'error': 'No department IDs provided'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    departments = Department.objects.filter(id__in=department_ids, status='active')
+    if not departments.exists():
+        return Response(
+            {'error': 'No active departments found with the provided IDs'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    assigned_count = 0
+    errors = []
+    
+    with transaction.atomic():
+        for department in departments:
+            # Get all approved mentees in this department
+            mentees = CustomUser.objects.filter(
+                role='mentee',
+                department=department.name,
+                status='approved'
+            )
+            
+            for mentee in mentees:
+                try:
+                    # Check if already assigned
+                    if MenteeOnboardingProgress.objects.filter(
+                        mentee=mentee,
+                        module=module
+                    ).exists():
+                        continue
+                    
+                    # Create progress record
+                    progress = MenteeOnboardingProgress.objects.create(
+                        mentee=mentee,
+                        module=module,
+                        status='not_started',
+                        progress_percentage=0,
+                        assigned_by=request.user
+                    )
+                    assigned_count += 1
+                    
+                    # Create deadline
+                    due_date = now() + timedelta(days=14)
+                    OnboardingDeadline.objects.create(
+                        module=module,
+                        mentee=mentee,
+                        due_date=due_date,
+                        original_due_date=due_date
+                    )
+                    
+                    # Send notification
+                    title = f"New Onboarding Module Assigned: {module.title}"
+                    message = f"""
+                    Hello {mentee.full_name},
+                    
+                    A new onboarding module has been assigned to your department:
+                    
+                    Module: {module.title}
+                    Department: {department.name}
+                    Description: {module.description[:200]}...
+                    
+                    Please log in to start this module.
+                    
+                    Best regards,
+                    Mentorship Program Team
+                    """
+                    
+                    send_onboarding_notification(
+                        recipient=mentee,
+                        notification_type='module_assigned',
+                        title=title,
+                        message=message,
+                        related_module=module,
+                        related_progress=progress
+                    )
+                    
+                except Exception as e:
+                    errors.append(f'Error assigning to {mentee.full_name}: {str(e)}')
+                    continue
+    
+    return Response({
+        'message': f'Module assigned to {assigned_count} mentees across {departments.count()} departments',
+        'assigned_count': assigned_count,
+        'departments_assigned': [dept.name for dept in departments],
+        'errors': errors if errors else None
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_department_comparison(request):
+    """
+    Compare onboarding progress across departments
+    """
+    if request.user.role not in ['admin', 'hr']:
+        return Response(
+            {'error': 'Only admins and HR can view department comparisons'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    departments = Department.objects.filter(status='active')
+    comparison_data = []
+    
+    for department in departments:
+        # Get mentees in department
+        mentees = CustomUser.objects.filter(
+            role='mentee',
+            department=department.name,
+            status='approved'
+        )
+        
+        # Get progress records
+        progress_records = MenteeOnboardingProgress.objects.filter(
+            mentee__department=department.name
+        )
+        
+        # Calculate statistics
+        total_mentees = mentees.count()
+        total_modules = progress_records.count()
+        completed_modules = progress_records.filter(status='completed').count()
+        
+        # Calculate average progress
+        avg_progress = progress_records.aggregate(
+            avg=Avg('progress_percentage')
+        )['avg'] or 0
+        
+        # Calculate on-time completion rate
+        if completed_modules > 0:
+            on_time_completions = OnboardingDeadline.objects.filter(
+                mentee__department=department.name,
+                module__mentee_progress__status='completed'
+            ).filter(
+                due_date__gte=F('module__mentee_progress__completed_at')
+            ).count()
+            on_time_rate = round((on_time_completions / completed_modules * 100), 2)
+        else:
+            on_time_rate = 0
+        
+        comparison_data.append({
+            'department_id': department.id,
+            'department_name': department.name,
+            'total_mentees': total_mentees,
+            'total_modules_assigned': total_modules,
+            'completed_modules': completed_modules,
+            'completion_rate': round((completed_modules / total_modules * 100), 2) if total_modules > 0 else 0,
+            'average_progress': round(avg_progress, 2),
+            'on_time_completion_rate': on_time_rate,
+            'mentees_behind_schedule': mentees.filter(
+                onboarding_progress__status__in=['overdue', 'off_track', 'needs_attention']
+            ).distinct().count()
+        })
+    
+    # Sort by completion rate (descending)
+    comparison_data.sort(key=lambda x: x['completion_rate'], reverse=True)
+    
+    return Response({
+        'comparison': comparison_data,
+        'summary': {
+            'total_departments': len(comparison_data),
+            'highest_completion_rate': max([d['completion_rate'] for d in comparison_data]) if comparison_data else 0,
+            'lowest_completion_rate': min([d['completion_rate'] for d in comparison_data]) if comparison_data else 0,
+            'average_completion_rate': round(
+                sum([d['completion_rate'] for d in comparison_data]) / len(comparison_data), 2
+            ) if comparison_data else 0
+        }
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_department_module_performance(request, module_id):
+    """
+    Get performance of a specific module across departments
+    """
+    module = get_object_or_404(OnboardingModule, id=module_id)
+    
+    if request.user.role not in ['admin', 'hr']:
+        if request.user.role == 'mentor':
+            # Mentors can only see their department
+            departments = Department.objects.filter(
+                name=request.user.department,
+                status='active'
+            )
+        else:
+            return Response(
+                {'error': 'You do not have permission to view this data'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+    else:
+        # Admin/HR can see all departments
+        departments = module.departments.all() if module.module_type == 'department' else Department.objects.filter(status='active')
+    
+    performance_data = []
+    
+    for department in departments:
+        # Get progress for this module and department
+        progress_records = MenteeOnboardingProgress.objects.filter(
+            module=module,
+            mentee__department=department.name
+        )
+        
+        total_assigned = progress_records.count()
+        completed = progress_records.filter(status='completed').count()
+        
+        # Calculate average time to complete
+        completed_records = progress_records.filter(status='completed')
+        avg_time = completed_records.aggregate(
+            avg=Avg('time_spent_minutes')
+        )['avg'] if completed_records.exists() else None
+        
+        performance_data.append({
+            'department_id': department.id,
+            'department_name': department.name,
+            'total_assigned': total_assigned,
+            'completed': completed,
+            'completion_rate': round((completed / total_assigned * 100), 2) if total_assigned > 0 else 0,
+            'in_progress': progress_records.filter(status='in_progress').count(),
+            'not_started': progress_records.filter(status='not_started').count(),
+            'behind_schedule': progress_records.filter(
+                status__in=['overdue', 'off_track', 'needs_attention']
+            ).count(),
+            'average_time_minutes': round(avg_time, 1) if avg_time else None,
+            'fastest_completion': completed_records.order_by('time_spent_minutes').first().time_spent_minutes if completed_records.exists() else None,
+            'slowest_completion': completed_records.order_by('-time_spent_minutes').first().time_spent_minutes if completed_records.exists() else None
+        })
+    
+    # Sort by completion rate (descending)
+    performance_data.sort(key=lambda x: x['completion_rate'], reverse=True)
+    
+    return Response({
+        'module': {
+            'id': module.id,
+            'title': module.title,
+            'type': module.module_type
+        },
+        'performance_by_department': performance_data,
+        'overall_stats': {
+            'total_departments': len(performance_data),
+            'total_assigned': sum([d['total_assigned'] for d in performance_data]),
+            'total_completed': sum([d['completed'] for d in performance_data]),
+            'overall_completion_rate': round(
+                sum([d['completed'] for d in performance_data]) / 
+                sum([d['total_assigned'] for d in performance_data]) * 100, 2
+            ) if sum([d['total_assigned'] for d in performance_data]) > 0 else 0
+        }
+    })
+
+
+# ================ UPDATE EXISTING VIEWS FOR DEPARTMENT SUPPORT ================
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_onboarding_modules(request):
     """
-    Get all active onboarding modules with filters
+    Get all active onboarding modules with department support
     """
     user = request.user
     queryset = OnboardingModule.objects.filter(is_active=True)
     
-    # Filter by department if specified
-    department = request.query_params.get('department', None)
-    if department:
-        queryset = queryset.filter(
-            Q(module_type='core') | Q(department=department)
-        )
+    # Filter by specific departments if provided
+    department_ids = request.query_params.getlist('department_ids[]')
+    if department_ids:
+        try:
+            department_ids = [int(id) for id in department_ids]
+            queryset = queryset.filter(
+                Q(module_type='core') | Q(departments__id__in=department_ids)
+            ).distinct()
+        except ValueError:
+            return Response(
+                {'error': 'Invalid department IDs'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
     
     # Filter by module type
-    module_type = request.query_params.get('module_type', None)
+    module_type = request.query_params.get('module_type')
     if module_type:
         queryset = queryset.filter(module_type=module_type)
     
-    # For mentors, show only modules relevant to their department
+    # For mentors, show only modules for their department
     if user.role == 'mentor':
         queryset = queryset.filter(
-            Q(module_type='core') | Q(department=user.department)
-        )
+            Q(module_type='core') | Q(departments__name=user.department)
+        ).distinct()
+    
+    # For mentees, show only applicable modules
+    elif user.role == 'mentee':
+        queryset = queryset.filter(
+            Q(module_type='core') | Q(departments__name=user.department)
+        ).distinct()
     
     serializer = OnboardingModuleSerializer(queryset, many=True)
     return Response(serializer.data)
 
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def auto_assign_modules(request):
+    """
+    Automatically assign appropriate modules to a mentee based on their department
+    """
+    if request.user.role not in ['admin', 'hr']:
+        return Response(
+            {'error': 'Only admins and HR can auto-assign modules'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    mentee_id = request.data.get('mentee_id')
+    if not mentee_id:
+        return Response(
+            {'error': 'mentee_id is required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        mentee = CustomUser.objects.get(id=mentee_id, role='mentee', status='approved')
+    except CustomUser.DoesNotExist:
+        return Response(
+            {'error': 'Mentee not found or not approved'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    # Get modules applicable to mentee's department
+    modules = OnboardingModule.objects.filter(
+        Q(module_type='core') | Q(departments__name=mentee.department),
+        is_active=True
+    ).distinct()
+    
+    assigned_count = 0
+    assigned_modules = []
+    
+    with transaction.atomic():
+        for module in modules:
+            # Check if already assigned
+            if not MenteeOnboardingProgress.objects.filter(
+                mentee=mentee,
+                module=module
+            ).exists():
+                progress = MenteeOnboardingProgress.objects.create(
+                    mentee=mentee,
+                    module=module,
+                    status='not_started',
+                    progress_percentage=0,
+                    assigned_by=request.user
+                )
+                
+                # Create deadline
+                due_date = now() + timedelta(days=14)
+                OnboardingDeadline.objects.create(
+                    module=module,
+                    mentee=mentee,
+                    due_date=due_date,
+                    original_due_date=due_date
+                )
+                
+                assigned_count += 1
+                assigned_modules.append({
+                    'id': module.id,
+                    'title': module.title,
+                    'type': module.module_type
+                })
+    
+    # Send notification
+    if assigned_count > 0:
+        title = "Onboarding Modules Assigned"
+        module_list = "\n".join([f"- {module['title']}" for module in assigned_modules])
+        
+        message = f"""
+        Hello {mentee.full_name},
+        
+        {assigned_count} onboarding modules have been automatically assigned to you based on your department ({mentee.department}):
+        
+        {module_list}
+        
+        Please log in to start your onboarding.
+        
+        Best regards,
+        Mentorship Program Team
+        """
+        
+        send_onboarding_notification(
+            recipient=mentee,
+            notification_type='module_assigned',
+            title=title,
+            message=message
+        )
+    
+    return Response({
+        'message': f'Auto-assigned {assigned_count} modules to {mentee.full_name}',
+        'assigned_count': assigned_count,
+        'assigned_modules': assigned_modules
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_department_modules(request):
+    """
+    Get modules for current user's department (updated for multiple departments)
+    """
+    user = request.user
+    
+    if user.role == 'mentee':
+        # For mentees, show modules for their department
+        queryset = OnboardingModule.objects.filter(
+            Q(module_type='core') | Q(departments__name=user.department),
+            is_active=True
+        ).distinct()
+    elif user.role == 'mentor':
+        # For mentors, show modules for their department
+        queryset = OnboardingModule.objects.filter(
+            Q(module_type='core') | Q(departments__name=user.department),
+            is_active=True
+        ).distinct()
+    else:
+        # Admin/HR can specify department
+        department_name = request.query_params.get('department')
+        if department_name:
+            queryset = OnboardingModule.objects.filter(
+                Q(module_type='core') | Q(departments__name=department_name),
+                is_active=True
+            ).distinct()
+        else:
+            # Show all modules
+            queryset = OnboardingModule.objects.filter(is_active=True)
+    
+    serializer = OnboardingModuleSerializer(queryset, many=True)
+    return Response(serializer.data)
+
+
+
+
+# ================ ONBOARDING MODULE VIEWS ================
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -457,6 +1158,7 @@ def get_onboarding_statistics(request):
         'mentees_with_modules': mentees_with_modules,
         'average_mentee_progress': round(avg_progress, 2)
     })
+
 
 
 @api_view(['POST'])
@@ -1559,38 +2261,6 @@ def extend_deadline(request, progress_id):
         'reason': reason,
         'extended_by': request.user.full_name
     })
-
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def get_department_modules(request):
-    """
-    Get modules for current user's department
-    """
-    user = request.user
-    
-    if user.role == 'mentee':
-        department = user.department
-    elif user.role == 'mentor':
-        department = user.department
-    else:
-        # Admin/HR can specify department
-        department = request.query_params.get('department')
-    
-    if not department:
-        return Response(
-            {'error': 'Department is required'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    
-    # Get core modules and department-specific modules
-    modules = OnboardingModule.objects.filter(
-        Q(module_type='core') | Q(department=department),
-        is_active=True
-    ).order_by('order')
-    
-    serializer = OnboardingModuleSerializer(modules, many=True)
-    return Response(serializer.data)
 
 
 @api_view(['GET'])

@@ -2,6 +2,7 @@ from django.db import models
 from django.utils.timezone import now
 from django.db.models import Avg, Sum
 from userApp.models import CustomUser
+from departmentApp.models import Department
 
 
 class OnboardingModule(models.Model):
@@ -13,7 +14,7 @@ class OnboardingModule(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField()
     module_type = models.CharField(max_length=20, choices=MODULE_TYPES, default='core')
-    department = models.CharField(max_length=100, blank=True, null=True)
+    departments = models.ManyToManyField(Department, related_name='modules', blank=True)
     order = models.IntegerField(default=0)
     is_required = models.BooleanField(default=True)
     duration_minutes = models.IntegerField(default=30, help_text="Estimated completion time in minutes")
@@ -35,42 +36,65 @@ class OnboardingModule(models.Model):
         verbose_name = 'Onboarding Module'
         verbose_name_plural = 'Onboarding Modules'
         indexes = [
-            models.Index(fields=['module_type', 'department']),
+            models.Index(fields=['module_type']),
             models.Index(fields=['is_active']),
         ]
     
     def __str__(self):
-        dept_suffix = f" - {self.department}" if self.department else ""
-        return f"{self.title} ({self.module_type}){dept_suffix}"
+        if self.module_type == 'core':
+            return f"{self.title} (Core)"
+        departments = self.departments.all()
+        if departments.exists():
+            dept_names = ", ".join([dept.name for dept in departments[:3]])
+            if departments.count() > 3:
+                dept_names += f" and {departments.count() - 3} more"
+            return f"{self.title} - Departments: {dept_names}"
+        return f"{self.title} (No Departments)"
     
     def get_applicable_departments(self):
         """Get list of departments this module applies to"""
         if self.module_type == 'core':
             return 'All Departments'
-        return self.department or 'Not Specified'
+        departments = self.departments.all()
+        if departments.exists():
+            return [dept.name for dept in departments]
+        return ['No Departments']
+    
+    def is_applicable_to_department(self, department_name):
+        """Check if module applies to specific department"""
+        if self.module_type == 'core':
+            return True
+        return self.departments.filter(name=department_name).exists()
     
     def calculate_days_to_complete(self):
         """Calculate estimated days to complete based on duration"""
-        # Assuming 4 hours per day for onboarding
-        hours_per_day = 4
+        hours_per_day = 4  # Assuming 4 hours per day for onboarding
         total_hours = self.duration_minutes / 60
         return round(total_hours / hours_per_day, 1)
     
-    def get_completion_rate(self):
-        """Get completion rate for this module"""
-        total_assigned = self.mentee_progress.count()
+    def get_completion_rate(self, department=None):
+        """Get completion rate for this module, optionally filtered by department"""
+        progress_query = self.mentee_progress.all()
+        
+        if department:
+            progress_query = progress_query.filter(mentee__department=department)
+        
+        total_assigned = progress_query.count()
         if total_assigned == 0:
             return 0
         
-        completed = self.mentee_progress.filter(status='completed').count()
+        completed = progress_query.filter(status='completed').count()
         return round((completed / total_assigned) * 100, 2)
     
-    def get_average_time_to_complete(self):
+    def get_average_time_to_complete(self, department=None):
         """Get average time taken by mentees to complete this module"""
         completed_progress = self.mentee_progress.filter(
             status='completed',
             time_spent_minutes__gt=0
         )
+        
+        if department:
+            completed_progress = completed_progress.filter(mentee__department=department)
         
         if completed_progress.exists():
             avg_time = completed_progress.aggregate(
@@ -78,6 +102,30 @@ class OnboardingModule(models.Model):
             )['avg_time']
             return round(avg_time, 1)
         return None
+    
+    def get_department_stats(self):
+        """Get statistics by department"""
+        departments = self.departments.all()
+        stats = []
+        
+        for department in departments:
+            dept_progress = self.mentee_progress.filter(mentee__department=department.name)
+            total = dept_progress.count()
+            completed = dept_progress.filter(status='completed').count()
+            completion_rate = round((completed / total * 100), 2) if total > 0 else 0
+            
+            stats.append({
+                'department_id': department.id,
+                'department_name': department.name,
+                'total_assigned': total,
+                'completed': completed,
+                'completion_rate': completion_rate,
+                'avg_time_spent': dept_progress.aggregate(
+                    avg=Avg('time_spent_minutes')
+                )['avg'] or 0
+            })
+        
+        return stats
 
 
 class MenteeOnboardingProgress(models.Model):
@@ -129,6 +177,7 @@ class MenteeOnboardingProgress(models.Model):
             models.Index(fields=['mentee', 'status']),
             models.Index(fields=['status']),
             models.Index(fields=['due_date']),
+            # Removed the problematic index on 'mentee__department'
         ]
     
     def __str__(self):
@@ -178,101 +227,9 @@ class MenteeOnboardingProgress(models.Model):
         
         return self.status
     
-    def mark_as_started(self):
-        """Mark module as started"""
-        if self.status == 'not_started':
-            self.status = 'in_progress'
-            self.started_at = now()
-            self.save()
-    
-    def mark_as_completed(self):
-        """Mark module as completed"""
-        if self.status != 'completed':
-            self.status = 'completed'
-            self.progress_percentage = 100
-            self.completed_at = now()
-            self.save()
-    
-    def mark_as_paused(self):
-        """Mark module as paused"""
-        self.status = 'paused'
-        self.save()
-    
-    def mark_as_needs_attention(self):
-        """Mark module as needs attention"""
-        self.status = 'needs_attention'
-        self.save()
-    
-    def mark_as_off_track(self):
-        """Mark module as off track"""
-        self.status = 'off_track'
-        self.save()
-    
-    def update_progress(self, percentage):
-        """Update progress percentage"""
-        if 0 <= percentage <= 100:
-            self.progress_percentage = percentage
-            
-            # Auto-start if progress > 0 and not started
-            if percentage > 0 and self.status == 'not_started':
-                self.mark_as_started()
-            
-            # Auto-complete if 100%
-            if percentage == 100:
-                self.mark_as_completed()
-            else:
-                self.save()
-    
-    def update_time_spent(self, minutes):
-        """Update time spent on this module"""
-        if minutes >= 0:
-            self.time_spent_minutes = minutes
-            self.save()
-    
-    def add_time_spent(self, minutes):
-        """Add time spent on this module"""
-        if minutes > 0:
-            self.time_spent_minutes += minutes
-            self.save()
-    
-    def get_days_remaining(self):
-        """Calculate days remaining until due date"""
-        if self.due_date and not self.completed_at:
-            from datetime import timedelta
-            remaining = self.due_date - now()
-            if remaining.days < 0:
-                return 0
-            return remaining.days
-        return None
-    
-    def get_hours_remaining(self):
-        """Calculate hours remaining based on module duration"""
-        remaining_percentage = 100 - self.progress_percentage
-        remaining_minutes = (remaining_percentage / 100) * self.module.duration_minutes
-        return round(remaining_minutes / 60, 1)
-    
-    def is_overdue(self):
-        """Check if the module is overdue"""
-        if self.due_date and not self.completed_at:
-            return now() > self.due_date
-        return False
-    
-    def get_progress_speed(self):
-        """Calculate progress speed (percentage per day)"""
-        if self.started_at and self.progress_percentage > 0:
-            days_since_start = (now() - self.started_at).days
-            if days_since_start > 0:
-                return round(self.progress_percentage / days_since_start, 1)
-        return 0
-    
-    def is_on_track(self):
-        """Check if progress is on track based on time and percentage"""
-        if self.due_date and self.started_at:
-            total_days = (self.due_date - self.started_at).days
-            if total_days > 0:
-                expected_progress = (100 / total_days) * (now() - self.started_at).days
-                return self.progress_percentage >= expected_progress
-        return True
+    def get_department(self):
+        """Get mentee's department"""
+        return self.mentee.department
 
 
 class OnboardingChecklist(models.Model):

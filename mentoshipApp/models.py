@@ -152,7 +152,6 @@ class MentorshipProgram(models.Model):
 
 
 class Mentorship(models.Model):
-    """Main mentorship relationship model"""
     STATUS_CHOICES = [
         ('pending', 'Pending'),
         ('active', 'Active'),
@@ -161,6 +160,7 @@ class Mentorship(models.Model):
         ('cancelled', 'Cancelled'),
     ]
     
+    # Relationships
     mentor = models.ForeignKey(
         CustomUser,
         on_delete=models.CASCADE,
@@ -173,139 +173,124 @@ class Mentorship(models.Model):
         limit_choices_to={'role': 'mentee'},
         related_name='mentorships_as_mentee'
     )
-    program = models.ForeignKey(
-        MentorshipProgram,
+    department = models.ForeignKey(
+        'departmentApp.Department',
         on_delete=models.CASCADE,
-        related_name='mentorships'
+        related_name='mentorships',
+        default=None
     )
-    status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default='pending'
+    programs = models.ManyToManyField(
+        MentorshipProgram,
+        related_name='active_mentorships',
+        blank=True
     )
+    current_program = models.ForeignKey(
+        MentorshipProgram,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='current_mentorships',
+        help_text="Current program being worked on"
+    )
+    completed_programs = models.ManyToManyField(
+        MentorshipProgram,
+        related_name='completed_by_mentorships',
+        blank=True
+    )
+    
+    # Status and Dates
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     start_date = models.DateField()
-    expected_end_date = models.DateField(
+    expected_end_date = models.DateField(null=True, blank=True)
+    actual_end_date = models.DateField(null=True, blank=True)
+    
+    # Progress Tracking
+    total_sessions_required = models.IntegerField(default=0, editable=False)
+    sessions_completed = models.IntegerField(default=0, validators=[MinValueValidator(0)])
+    
+    # Rating and Feedback
+    rating = models.FloatField(
         null=True,
         blank=True,
-        help_text="Auto-calculated based on program duration"
+        validators=[MinValueValidator(1.0), MaxValueValidator(5.0)]
     )
-    actual_end_date = models.DateField(
-        null=True,
-        blank=True,
-        help_text="Actual completion date"
-    )
-    sessions_completed = models.IntegerField(
-        default=0,
-        validators=[MinValueValidator(0)]
-    )
-    rating = models.DecimalField(
-        max_digits=3,
-        decimal_places=2,
-        null=True,
-        blank=True,
-        validators=[MinValueValidator(0), MaxValueValidator(5)],
-        help_text="Overall mentorship rating (0-5)"
-    )
-    feedback = models.TextField(
-        blank=True,
-        null=True,
-        help_text="Overall feedback about the mentorship"
-    )
-    goals = models.JSONField(
-        default=list,
-        help_text="Mentorship goals set at the beginning"
-    )
-    achievements = models.JSONField(
-        default=list,
-        help_text="Goals achieved during mentorship"
-    )
-    notes = models.TextField(
-        blank=True,
-        null=True,
-        help_text="Internal notes about the mentorship"
-    )
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    goals = models.TextField(blank=True)
+    achievements = models.TextField(blank=True)
+    feedback = models.TextField(blank=True, default="")
+    notes = models.TextField(blank=True, default="")
+    
+    # Metadata
     created_by = models.ForeignKey(
         CustomUser,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='created_mentorships',
-        help_text="User who created this mentorship"
+        related_name='created_mentorships'
     )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
-        unique_together = [['mentor', 'mentee', 'program']]
+        unique_together = [['mentor', 'mentee', 'department']]
         ordering = ['-created_at']
         verbose_name = 'Mentorship'
         verbose_name_plural = 'Mentorships'
         indexes = [
             models.Index(fields=['status']),
-            models.Index(fields=['mentor', 'status']),
-            models.Index(fields=['mentee', 'status']),
             models.Index(fields=['start_date']),
-            models.Index(fields=['program']),
+            models.Index(fields=['-created_at']),
         ]
     
     def __str__(self):
-        return f"{self.mentor.full_name} → {self.mentee.full_name} ({self.program.name})"
+        return f"{self.mentor.full_name} → {self.mentee.full_name} ({self.department.name})"
     
-    def save(self, *args, **kwargs):
-        """Auto-calculate expected_end_date and auto-complete if all sessions done"""
-        from datetime import timedelta
-        
-        # Calculate expected end date
-        if self.start_date and self.program.total_days > 0 and not self.expected_end_date:
-            self.expected_end_date = self.start_date + timedelta(days=self.program.total_days)
-        
-        # Auto-complete if all sessions are done
-        total_sessions = self.program.get_total_sessions()
-        if self.sessions_completed >= total_sessions and self.status == 'active':
-            self.status = 'completed'
-            if not self.actual_end_date:
-                self.actual_end_date = now().date()
-        
-        super().save(*args, **kwargs)
-    
-    def get_progress_percentage(self):
-        """Calculate progress percentage based on sessions"""
-        total_sessions = self.program.get_total_sessions()
-        if total_sessions == 0:
-            return 0
-        return round((self.sessions_completed / total_sessions) * 100, 2)
-    
+    # Keep all your existing methods...
     def get_remaining_sessions(self):
         """Get number of remaining sessions"""
-        total_sessions = self.program.get_total_sessions()
-        return max(0, total_sessions - self.sessions_completed)
+        return max(0, self.total_sessions_required - self.sessions_completed)
     
-    def mark_session_completed(self):
-        """Increment completed sessions and check for completion"""
-        self.sessions_completed += 1
-        self.save()
-    
-    def can_schedule_session(self):
-        """Check if more sessions can be scheduled"""
-        total_sessions = self.program.get_total_sessions()
-        return (
-            self.status in ['active', 'pending'] and 
-            self.sessions_completed < total_sessions
-        )
-    
-    def get_duration_days(self):
-        """Get mentorship duration in days"""
-        if self.actual_end_date:
-            return (self.actual_end_date - self.start_date).days
-        return (now().date() - self.start_date).days
-    
-    def is_overdue(self):
-        """Check if mentorship is overdue based on expected end date"""
-        if self.expected_end_date and self.status == 'active':
-            return now().date() > self.expected_end_date
-        return False
+    def get_progress_percentage(self):
+        """Calculate overall progress percentage"""
+        if self.total_sessions_required == 0:
+            return 0
+        return round((self.sessions_completed / self.total_sessions_required) * 100, 2)
 
-
+class MentorshipProgramProgress(models.Model):
+    """Track mentee's progress in each program within the department"""
+    mentorship = models.ForeignKey(
+        Mentorship,
+        on_delete=models.CASCADE,
+        related_name='program_progress'
+    )
+    program = models.ForeignKey(
+        MentorshipProgram,
+        on_delete=models.CASCADE,
+        related_name='mentee_progress'
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=[
+            ('not_started', 'Not Started'),
+            ('in_progress', 'In Progress'),
+            ('completed', 'Completed'),
+            ('paused', 'Paused'),
+        ],
+        default='not_started'
+    )
+    sessions_completed = models.IntegerField(default=0)
+    total_sessions = models.IntegerField(default=0)
+    progress_percentage = models.IntegerField(default=0)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        unique_together = [['mentorship', 'program']]
+        # FIX: Remove 'program__order' from ordering since we don't know if it exists
+        # Use program's natural ordering instead
+        ordering = ['program']  # FIXED
+        verbose_name = 'Mentorship Program Progress'
+        verbose_name_plural = 'Mentorship Program Progress'
+        
 class MentorshipSession(models.Model):
     """Individual mentorship session based on program session template"""
     SESSION_STATUS = [
@@ -316,17 +301,39 @@ class MentorshipSession(models.Model):
         ('no_show', 'No Show'),
     ]
     
+    
     mentorship = models.ForeignKey(
         Mentorship,
         on_delete=models.CASCADE,
         related_name='sessions'
     )
+    # Link to the specific program this session belongs to
+    program = models.ForeignKey(
+        MentorshipProgram,
+        on_delete=models.CASCADE,
+        related_name='sessions',
+        default=None
+    )
+    program_progress = models.ForeignKey(
+        MentorshipProgramProgress,
+        on_delete=models.CASCADE,
+        related_name='sessions',
+        null=True,
+        blank=True
+    )
+    # Keep session template for structure
     session_template = models.ForeignKey(
         ProgramSessionTemplate,
         on_delete=models.SET_NULL,
         null=True,
-        related_name='mentorship_sessions',
-        help_text="Session template this session is based on"
+        related_name='mentorship_sessions'
+    )
+    
+    # Add program-specific session number
+    program_session_number = models.IntegerField(
+        validators=[MinValueValidator(1)],
+        help_text="Session number within this program",
+        default=1
     )
     session_number = models.IntegerField(
         validators=[MinValueValidator(1)],

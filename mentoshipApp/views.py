@@ -1,4 +1,3 @@
-# mentorshipApp/views.py
 from django.forms import ValidationError
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -12,6 +11,7 @@ from asgiref.sync import async_to_sync
 from datetime import timedelta
 from notificationApp.models import ChatNotification
 from chatApp.models import ChatRoom
+from departmentApp.models import Department
 
 from .models import (
     MentorshipProgram, Mentorship, MentorshipSession,
@@ -68,23 +68,32 @@ def list_departments(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_department_programs(request, department):
-    """Get all programs for a specific department"""
+    """
+    Get all programs for a specific department.
+    Note: 'department' parameter can be either department ID or department name
+    """
     try:
-        if department not in DEPARTMENTS:
+        from departmentApp.models import Department
+        
+        # Try to get department by ID first (department parameter might already be an int)
+        try:
+            # Check if it's a string that can be converted to int
+            if isinstance(department, str) and department.isdigit():
+                department_id = int(department)
+                department_obj = Department.objects.get(id=department_id)
+            elif isinstance(department, int):
+                department_obj = Department.objects.get(id=department)
+            else:
+                # If not a number, treat it as a department name
+                department_obj = Department.objects.get(name=department)
+        except Department.DoesNotExist:
             return Response({
-                'error': f'Invalid department. Must be one of: {", ".join(DEPARTMENTS)}'
-            }, status=status.HTTP_400_BAD_REQUEST)
+                'error': f'Department "{department}" not found'
+            }, status=status.HTTP_404_NOT_FOUND)
         
-        user = request.user
-        
-        # Check if user has access to this department
-        if user.role in ['mentor', 'mentee'] and user.department != department:
-            return Response({
-                'error': 'Permission denied. You can only view programs in your department'
-            }, status=status.HTTP_403_FORBIDDEN)
-        
+        # Get programs for this department
         programs = MentorshipProgram.objects.filter(
-            department=department,
+            department=department_obj.name,
             status='active'
         )
         
@@ -92,86 +101,255 @@ def get_department_programs(request, department):
         
         return Response({
             'success': True,
-            'department': department,
+            'department': {
+                'id': department_obj.id,
+                'name': department_obj.name,
+                'description': department_obj.description
+            },
             'count': programs.count(),
             'programs': serializer.data
         }, status=status.HTTP_200_OK)
+        
     except Exception as e:
+        print(f"Error in get_department_programs: {str(e)}")
         return Response({
             'error': 'Failed to fetch department programs',
+            'detail': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_available_mentors(request):
+    """Get available mentors for a specific department"""
+    try:
+        department_param = request.query_params.get('department')
+        
+        if not department_param:
+            return Response({
+                'error': 'Department parameter is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get the Department object
+        try:
+            # Check if it's a department ID (number)
+            if department_param.isdigit():
+                department_obj = Department.objects.get(id=int(department_param))
+            else:
+                # Treat it as a department name
+                department_obj = Department.objects.get(name=department_param)
+        except Department.DoesNotExist:
+            return Response({
+                'error': f'Department "{department_param}" not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get active mentors in the specified department
+        available_mentors = CustomUser.objects.filter(
+            role='mentor',
+            department=department_obj,  # Use the Department object
+            status='approved',
+            availability_status='active'
+        )
+        
+        # For mentors, we also need to check if they have this department in their M2M relationship
+        mentors_in_department = CustomUser.objects.filter(
+            role='mentor',
+            departments=department_obj,  # Check M2M relationship
+            status='approved',
+            availability_status='active'
+        )
+        
+        # Combine both querysets and remove duplicates
+        all_mentors = (available_mentors | mentors_in_department).distinct()
+        
+        # Check current workload
+        mentors_data = []
+        for mentor in all_mentors:
+            # Count active mentorships
+            active_mentorships = Mentorship.objects.filter(
+                mentor=mentor,
+                status='active'
+            ).count()
+            
+            # Calculate workload percentage
+            workload_percentage = min(active_mentorships * 20, 100)  # 5 mentees max = 100%
+            
+            mentors_data.append({
+                'id': mentor.id,
+                'full_name': mentor.full_name,
+                'email': mentor.email,
+                'work_mail_address': mentor.work_mail_address,
+                'department': mentor.department.name if mentor.department else department_obj.name,
+                'department_id': department_obj.id,
+                'phone_number': mentor.phone_number,
+                'availability_status': mentor.availability_status,
+                'active_mentorships': active_mentorships,
+                'workload_percentage': workload_percentage,
+                'is_available': active_mentorships < 5,  # Max 5 mentees per mentor
+                'assigned_departments': [
+                    {'id': dept.id, 'name': dept.name} 
+                    for dept in mentor.departments.all()
+                ]
+            })
+        
+        # Sort by availability (more available first)
+        mentors_data.sort(key=lambda x: (x['active_mentorships'], x['full_name']))
+        
+        return Response({
+            'success': True,
+            'department': department_obj.name,
+            'department_id': department_obj.id,
+            'count': len(mentors_data),
+            'available_count': len([m for m in mentors_data if m['is_available']]),
+            'mentors': mentors_data
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        print(f"Error in get_available_mentors: {str(e)}")
+        return Response({
+            'error': 'Failed to fetch available mentors',
             'detail': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-def get_available_mentors(request):
-    """Get available mentors for a department"""
+def get_ready_mentees(request):
+    """Get mentees who have completed onboarding and are ready for mentorship"""
     try:
-        department = request.query_params.get('department')
-        program_id = request.query_params.get('program_id')
+        department_param = request.query_params.get('department')
         
-        if not department:
+        if not department_param:
             return Response({
                 'error': 'Department parameter is required'
             }, status=status.HTTP_400_BAD_REQUEST)
         
-        if department not in DEPARTMENTS:
-            return Response({
-                'error': f'Invalid department. Must be one of: {", ".join(DEPARTMENTS)}'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Get available mentors in the department
-        mentors = CustomUser.objects.filter(
-            role='mentor',
-            department=department,
-            status='approved',
-            availability_status='active'
-        ).select_related('profile')
-        
-        mentor_data = []
-        for mentor in mentors:
-            # Get mentor's current workload
-            active_mentorships = Mentorship.objects.filter(
-                mentor=mentor,
-                status='active'
-            ).count()
-            
-            # Get mentor's specialization programs
-            if program_id:
-                try:
-                    program = MentorshipProgram.objects.get(id=program_id)
-                    # Check if mentor is already assigned to this program
-                    has_program = Mentorship.objects.filter(
-                        mentor=mentor,
-                        program=program,
-                        status='active'
-                    ).exists()
-                except MentorshipProgram.DoesNotExist:
-                    has_program = False
+        # Get the Department object
+        try:
+            # Check if it's a department ID (number)
+            if department_param.isdigit():
+                department_obj = Department.objects.get(id=int(department_param))
             else:
-                has_program = None
+                # Treat it as a department name
+                department_obj = Department.objects.get(name=department_param)
+        except Department.DoesNotExist:
+            return Response({
+                'error': f'Department "{department_param}" not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        from onboarding.models import OnboardingModule, MenteeOnboardingProgress
+        
+        # Get all mentees in the department (using ForeignKey)
+        mentees = CustomUser.objects.filter(
+            role='mentee',
+            department=department_obj,  # Use the Department object
+            status='approved'
+        )
+        
+        ready_mentees_data = []
+        for mentee in mentees:
+            # Check if mentee has completed all required core modules
+            required_core_modules = OnboardingModule.objects.filter(
+                module_type='core',
+                is_required=True,
+                is_active=True
+            )
             
-            mentor_data.append({
-                'id': mentor.id,
-                'full_name': mentor.full_name,
-                'email': mentor.email,
-                'department': mentor.department,
-                'availability_status': mentor.availability_status,
-                'active_mentorships': active_mentorships,
-                'has_program': has_program if program_id else None,
-                'expertise': mentor.profile.expertise if hasattr(mentor, 'profile') else []
+            # Check if mentee has completed all required department-specific modules
+            required_department_modules = OnboardingModule.objects.filter(
+                module_type='department',
+                departments=department_obj,  # Use M2M relationship
+                is_required=True,
+                is_active=True
+            )
+            
+            all_required_modules = list(required_core_modules) + list(required_department_modules)
+            
+            # Check completion status for each module
+            incomplete_modules = []
+            completed_modules = []
+            
+            for module in all_required_modules:
+                progress = MenteeOnboardingProgress.objects.filter(
+                    mentee=mentee,
+                    module=module
+                ).first()
+                
+                if progress and progress.status == 'completed':
+                    completed_modules.append({
+                        'id': module.id,
+                        'title': module.title,
+                        'type': module.module_type
+                    })
+                else:
+                    incomplete_modules.append({
+                        'id': module.id,
+                        'title': module.title,
+                        'type': module.module_type,
+                        'progress': progress.progress_percentage if progress else 0
+                    })
+            
+            # Check if mentee already has active mentorship in this department
+            has_active_mentorship = Mentorship.objects.filter(
+                mentee=mentee,
+                status__in=['pending', 'active'],
+                program__department=department_obj.name
+            ).exists()
+            
+            # Calculate overall onboarding progress
+            total_modules = len(all_required_modules)
+            completed_count = len(completed_modules)
+            onboarding_progress = round((completed_count / total_modules * 100), 2) if total_modules > 0 else 0
+            
+            # Determine eligibility
+            is_eligible = (
+                len(incomplete_modules) == 0 and  # All modules completed
+                not has_active_mentorship and      # No active mentorship in this department
+                total_modules > 0                  # Has required modules
+            )
+            
+            ready_mentees_data.append({
+                'id': mentee.id,
+                'full_name': mentee.full_name,
+                'email': mentee.email,
+                'work_mail_address': mentee.work_mail_address,
+                'department': mentee.department.name if mentee.department else department_obj.name,
+                'department_id': department_obj.id,
+                'phone_number': mentee.phone_number,
+                'status': mentee.status,
+                'availability_status': mentee.availability_status,
+                'onboarding_completed': len(incomplete_modules) == 0,
+                'onboarding_progress': onboarding_progress,
+                'completed_modules_count': completed_count,
+                'total_modules_required': total_modules,
+                'has_active_mentorship': has_active_mentorship,
+                'last_active': mentee.last_login,
+                'created_at': mentee.created_at,
+                'is_eligible': is_eligible,
+                'incomplete_modules': incomplete_modules,
+                'completed_modules': completed_modules
             })
+        
+        # Sort by eligibility and onboarding completion
+        ready_mentees_data.sort(key=lambda x: (
+            not x['is_eligible'],  # Eligible first
+            -x['onboarding_progress'],  # Higher progress first
+            x['full_name']  # Alphabetical
+        ))
         
         return Response({
             'success': True,
-            'department': department,
-            'mentors': mentor_data,
-            'count': len(mentor_data)
+            'department': department_obj.name,
+            'department_id': department_obj.id,
+            'total_mentees': mentees.count(),
+            'eligible_count': len([m for m in ready_mentees_data if m['is_eligible']]),
+            'ready_count': len([m for m in ready_mentees_data if m['onboarding_completed']]),
+            'mentees': ready_mentees_data
         }, status=status.HTTP_200_OK)
+        
     except Exception as e:
+        print(f"Error in get_ready_mentees: {str(e)}")
         return Response({
-            'error': 'Failed to fetch available mentors',
+            'error': 'Failed to fetch ready mentees',
             'detail': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -293,7 +471,7 @@ def create_mentorship_program(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_mentorship(request):
-    """Create a new mentorship (Admin/HR only)"""
+    """Create a new department-based mentorship"""
     try:
         if request.user.role not in ['admin', 'hr']:
             return Response({
@@ -310,17 +488,37 @@ def create_mentorship(request):
         
         data = serializer.validated_data
         
+        # Get department
+        department_id = data.get('department_id')
+        try:
+            department = Department.objects.get(id=department_id, status='active')
+        except Department.DoesNotExist:
+            return Response({
+                'error': 'Department not found or inactive'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
         # Create mentorship
         mentorship = Mentorship.objects.create(
             mentor_id=data['mentor_id'],
             mentee_id=data['mentee_id'],
-            program_id=data['program_id'],
+            department=department,
             start_date=data['start_date'],
             goals=data.get('goals', []),
             notes=data.get('notes', ''),
-            status='active',  # Start immediately
+            status='active',
             created_by=request.user
         )
+        
+        # Initialize program progress for all active programs in department
+        programs_in_department = MentorshipProgram.objects.filter(
+            department=department.name,
+            status='active'
+        )
+        
+        # Set current program to the first one
+        if programs_in_department.exists():
+            mentorship.current_program = programs_in_department.first()
+            mentorship.save()
         
         # Create chat room automatically
         chat_room = ChatRoom.objects.create(
@@ -328,85 +526,12 @@ def create_mentorship(request):
             is_active=True
         )
         
-        # Send email notifications
-        from django.core.mail import send_mail
-        from django.conf import settings
-        
-        # Email to mentee
-        mentee_subject = f"You have been assigned a mentor for {mentorship.program.name}"
-        mentee_message = f"""
-        Hello {mentorship.mentee.full_name},
-        
-        You have been assigned a mentor for the {mentorship.program.name} program.
-        
-        Your Mentor: {mentorship.mentor.full_name}
-        Program: {mentorship.program.name}
-        Department: {mentorship.program.department}
-        Start Date: {mentorship.start_date}
-        
-        You can now communicate with your mentor through the mentorship portal.
-        
-        Best regards,
-        Mentorship Program Team
-        """
-        
-        send_mail(
-            subject=mentee_subject,
-            message=mentee_message,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[mentorship.mentee.email],
-            fail_silently=True,
-        )
-        
-        # Email to mentor
-        mentor_subject = f"New mentee assigned: {mentorship.mentee.full_name}"
-        mentor_message = f"""
-        Hello {mentorship.mentor.full_name},
-        
-        A new mentee has been assigned to you.
-        
-        Mentee: {mentorship.mentee.full_name}
-        Program: {mentorship.program.name}
-        Department: {mentorship.program.department}
-        Start Date: {mentorship.start_date}
-        Mentee's Goals: {', '.join(mentorship.goals) if mentorship.goals else 'Not specified'}
-        
-        Please connect with your mentee and start the mentorship program.
-        
-        Best regards,
-        Mentorship Program Team
-        """
-        
-        send_mail(
-            subject=mentor_subject,
-            message=mentor_message,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[mentorship.mentor.email],
-            fail_silently=True,
-        )
-        
-        # Create chat notifications
-        ChatNotification.objects.create(
-            recipient=mentorship.mentee,
-            chat_room=chat_room,
-            notification_type='case_assigned',
-            title='New Mentor Assigned',
-            message=f'You have been assigned {mentorship.mentor.full_name} as your mentor'
-        )
-        
-        ChatNotification.objects.create(
-            recipient=mentorship.mentor,
-            chat_room=chat_room,
-            notification_type='case_assigned',
-            title='New Mentee Assigned',
-            message=f'You have been assigned {mentorship.mentee.full_name} as your mentee'
-        )
+        # Send notifications...
         
         return Response({
             'success': True,
-            'message': 'Mentorship created successfully',
-            'mentorship': MentorshipSerializer(mentorship).data,
-            'chat_room_id': chat_room.id
+            'message': 'Department-based mentorship created successfully',
+            'mentorship': MentorshipSerializer(mentorship).data
         }, status=status.HTTP_201_CREATED)
     
     except Exception as e:
@@ -414,9 +539,6 @@ def create_mentorship(request):
             'error': 'Failed to create mentorship',
             'detail': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -460,9 +582,10 @@ def get_session_template(request, template_id):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_session(request):
-    """Create a new session"""
+
+    """Create a session for the current program in mentorship"""
     try:
-        serializer = MentorshipSessionSerializer(data=request.data, context={'request': request})
+        serializer = SessionCreateSerializer(data=request.data)
         
         if not serializer.is_valid():
             return Response({
@@ -471,31 +594,47 @@ def create_session(request):
             }, status=status.HTTP_400_BAD_REQUEST)
         
         data = serializer.validated_data
-        mentorship = get_object_or_404(Mentorship, id=request.data.get('mentorship_id'))
+        mentorship = get_object_or_404(Mentorship, id=data['mentorship_id'])
         
-        # Check permissions
-        if request.user not in [mentorship.mentor, mentorship.mentee] and request.user.role not in ['admin', 'hr']:
+        # Check if mentorship has a current program
+        if not mentorship.current_program:
             return Response({
-                'error': 'Permission denied. Only participants, Admin, or HR can schedule sessions'
-            }, status=status.HTTP_403_FORBIDDEN)
+                'error': 'No current program assigned to this mentorship'
+            }, status=status.HTTP_400_BAD_REQUEST)
         
-        # Check for scheduling conflicts
-        conflicts = MentorshipSession.objects.filter(
-            Q(mentorship__mentor=mentorship.mentor) | Q(mentorship__mentee=mentorship.mentee),
-            status='scheduled',
-            scheduled_date__date=data['scheduled_date'].date()
-        )
+        # Create session for current program
+        program_progress = mentorship.program_progress.filter(
+            program=mentorship.current_program
+        ).first()
         
-        for conflict in conflicts:
-            time_diff = abs((conflict.scheduled_date - data['scheduled_date']).total_seconds() / 3600)
-            if time_diff < (data.get('duration_minutes', 60) / 60):
-                return Response({
-                    'error': 'Scheduling conflict detected',
-                    'message': f'There is another session scheduled at {conflict.scheduled_date}'
-                }, status=status.HTTP_400_BAD_REQUEST)
+        if not program_progress:
+            return Response({
+                'error': 'Program progress not found'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get next session number for this program
+        last_session = MentorshipSession.objects.filter(
+            mentorship=mentorship,
+            program=mentorship.current_program
+        ).order_by('-program_session_number').first()
+        
+        program_session_number = (last_session.program_session_number + 1) if last_session else 1
         
         # Create session
-        session = serializer.save()
+        session = MentorshipSession.objects.create(
+            mentorship=mentorship,
+            program=mentorship.current_program,
+            program_progress=program_progress,
+            session_template_id=data.get('session_template_id'),
+            program_session_number=program_session_number,
+            session_type=data.get('session_type', 'video'),
+            scheduled_date=data['scheduled_date'],
+            duration_minutes=data.get('duration_minutes', 60),
+            agenda=data.get('agenda', ''),
+            meeting_link=data.get('meeting_link', ''),
+            location=data.get('location', ''),
+            status='scheduled'
+        )
         
         return Response({
             'success': True,
@@ -503,16 +642,12 @@ def create_session(request):
             'session': MentorshipSessionSerializer(session).data
         }, status=status.HTTP_201_CREATED)
     
-    except ValidationError as e:
-        return Response({
-            'error': 'Validation failed',
-            'detail': str(e)
-        }, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         return Response({
             'error': 'Failed to create session',
             'detail': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
 
 
 @api_view(['POST'])
@@ -764,6 +899,7 @@ def list_mentorship_programs(request):
         
         if status_filter:
             if status_filter not in ['active', 'inactive', 'archived']:
+                print(f"Invalid status filter received: {status_filter}")
                 return Response({
                     'error': 'Invalid status filter. Must be: active, inactive, or archived'
                 }, status=status.HTTP_400_BAD_REQUEST)
@@ -781,6 +917,7 @@ def list_mentorship_programs(request):
         }, status=status.HTTP_200_OK)
     
     except Exception as e:
+        print(f"Error in list_mentorship_programs: {str(e)}")
         return Response({
             'error': 'An error occurred while fetching programs',
             'detail': str(e)
@@ -899,6 +1036,7 @@ def list_mentorships(request):
         elif user.role in ['admin', 'hr']:
             mentorships = Mentorship.objects.all()
         else:
+            print(f"Invalid user role encountered: {user.role}")
             return Response({
                 'error': 'Invalid user role'
             }, status=status.HTTP_403_FORBIDDEN)
@@ -906,6 +1044,7 @@ def list_mentorships(request):
         # Apply filters
         if status_filter:
             if status_filter not in dict(Mentorship.STATUS_CHOICES).keys():
+                print(f"Invalid status filter received: {status_filter}")
                 return Response({
                     'error': f'Invalid status. Must be one of: {", ".join(dict(Mentorship.STATUS_CHOICES).keys())}'
                 }, status=status.HTTP_400_BAD_REQUEST)
@@ -915,6 +1054,7 @@ def list_mentorships(request):
             try:
                 mentorships = mentorships.filter(program_id=int(program_filter))
             except (ValueError, TypeError):
+                print(f"Invalid program filter received: {program_filter}")
                 return Response({
                     'error': 'Invalid program ID'
                 }, status=status.HTTP_400_BAD_REQUEST)
@@ -929,6 +1069,7 @@ def list_mentorships(request):
         }, status=status.HTTP_200_OK)
     
     except Exception as e:
+        print(f"Error in list_mentorships: {str(e)}")
         return Response({
             'error': 'An error occurred while fetching mentorships',
             'detail': str(e)
@@ -1416,3 +1557,520 @@ def cancel_session(request, session_id):
 
 
 
+# Add these views to your mentorshipApp/views.py
+
+# Update the get_available_mentors view in mentorshipApp/views.py
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_available_mentors(request):
+    """Get available mentors for a specific department"""
+    try:
+        department_name = request.query_params.get('department')
+        
+        if not department_name:
+            return Response({
+                'error': 'Department parameter is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # First, get the Department object by name
+        try:
+            department_obj = Department.objects.get(name=department_name)
+        except Department.DoesNotExist:
+            return Response({
+                'error': f'Department "{department_name}" not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get active mentors in the specified department
+        available_mentors = CustomUser.objects.filter(
+            role='mentor',
+            department=department_obj,  # Use the Department object
+            status='approved',
+            availability_status='active'
+        )
+        
+        # For mentors, we also need to check if they have this department in their M2M relationship
+        mentors_in_department = CustomUser.objects.filter(
+            role='mentor',
+            departments=department_obj,  # Check M2M relationship
+            status='approved',
+            availability_status='active'
+        )
+        
+        # Combine both querysets and remove duplicates
+        all_mentors = (available_mentors | mentors_in_department).distinct()
+        
+        # Check current workload
+        mentors_data = []
+        for mentor in all_mentors:
+            # Count active mentorships
+            active_mentorships = Mentorship.objects.filter(
+                mentor=mentor,
+                status='active'
+            ).count()
+            
+            # Calculate workload percentage
+            workload_percentage = min(active_mentorships * 20, 100)  # 5 mentees max = 100%
+            
+            mentors_data.append({
+                'id': mentor.id,
+                'full_name': mentor.full_name,
+                'email': mentor.email,
+                'work_mail_address': mentor.work_mail_address,
+                'department': mentor.department.name if mentor.department else department_name,
+                'phone_number': mentor.phone_number,
+                'availability_status': mentor.availability_status,
+                'active_mentorships': active_mentorships,
+                'workload_percentage': workload_percentage,
+                'is_available': active_mentorships < 5,  # Max 5 mentees per mentor
+                'assigned_departments': [
+                    {'id': dept.id, 'name': dept.name} 
+                    for dept in mentor.departments.all()
+                ]
+            })
+        
+        # Sort by availability (more available first)
+        mentors_data.sort(key=lambda x: (x['active_mentorships'], x['full_name']))
+        
+        return Response({
+            'success': True,
+            'department': department_name,
+            'department_id': department_obj.id,
+            'count': len(mentors_data),
+            'available_count': len([m for m in mentors_data if m['is_available']]),
+            'mentors': mentors_data
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        print(f"Error in get_available_mentors: {str(e)}")
+        return Response({
+            'error': 'Failed to fetch available mentors',
+            'detail': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_ready_mentees(request):
+    """Get mentees who have completed onboarding and are ready for mentorship"""
+    try:
+        department_name = request.query_params.get('department')
+        
+        if not department_name:
+            return Response({
+                'error': 'Department parameter is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # First, get the Department object by name
+        try:
+            department_obj = Department.objects.get(name=department_name)
+        except Department.DoesNotExist:
+            return Response({
+                'error': f'Department "{department_name}" not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        from onboarding.models import OnboardingModule, MenteeOnboardingProgress
+        
+        # Get all mentees in the department (using ForeignKey)
+        mentees = CustomUser.objects.filter(
+            role='mentee',
+            department=department_obj,  # Use the Department object
+            status='approved'
+        )
+        
+        ready_mentees_data = []
+        for mentee in mentees:
+            # Check if mentee has completed all required core modules
+            required_core_modules = OnboardingModule.objects.filter(
+                module_type='core',
+                is_required=True,
+                is_active=True
+            )
+            
+            # Check if mentee has completed all required department-specific modules
+            required_department_modules = OnboardingModule.objects.filter(
+                module_type='department',
+                departments=department_obj,  # Use M2M relationship
+                is_required=True,
+                is_active=True
+            )
+            
+            all_required_modules = list(required_core_modules) + list(required_department_modules)
+            
+            # Check completion status for each module
+            incomplete_modules = []
+            completed_modules = []
+            
+            for module in all_required_modules:
+                progress = MenteeOnboardingProgress.objects.filter(
+                    mentee=mentee,
+                    module=module
+                ).first()
+                
+                if progress and progress.status == 'completed':
+                    completed_modules.append({
+                        'id': module.id,
+                        'title': module.title,
+                        'type': module.module_type
+                    })
+                else:
+                    incomplete_modules.append({
+                        'id': module.id,
+                        'title': module.title,
+                        'type': module.module_type,
+                        'progress': progress.progress_percentage if progress else 0
+                    })
+            
+            # Check if mentee already has active mentorship in this department
+            has_active_mentorship = Mentorship.objects.filter(
+                mentee=mentee,
+                status__in=['pending', 'active'],
+                program__department=department_name
+            ).exists()
+            
+            # Calculate overall onboarding progress
+            total_modules = len(all_required_modules)
+            completed_count = len(completed_modules)
+            onboarding_progress = round((completed_count / total_modules * 100), 2) if total_modules > 0 else 0
+            
+            # Determine eligibility
+            is_eligible = (
+                len(incomplete_modules) == 0 and  # All modules completed
+                not has_active_mentorship and      # No active mentorship in this department
+                total_modules > 0                  # Has required modules
+            )
+            
+            ready_mentees_data.append({
+                'id': mentee.id,
+                'full_name': mentee.full_name,
+                'email': mentee.email,
+                'work_mail_address': mentee.work_mail_address,
+                'department': mentee.department.name if mentee.department else department_name,
+                'department_id': department_obj.id,
+                'phone_number': mentee.phone_number,
+                'status': mentee.status,
+                'availability_status': mentee.availability_status,
+                'onboarding_completed': len(incomplete_modules) == 0,
+                'onboarding_progress': onboarding_progress,
+                'completed_modules_count': completed_count,
+                'total_modules_required': total_modules,
+                'has_active_mentorship': has_active_mentorship,
+                'last_active': mentee.last_login,
+                'created_at': mentee.created_at,
+                'is_eligible': is_eligible,
+                'incomplete_modules': incomplete_modules,
+                'completed_modules': completed_modules
+            })
+        
+        # Sort by eligibility and onboarding completion
+        ready_mentees_data.sort(key=lambda x: (
+            not x['is_eligible'],  # Eligible first
+            -x['onboarding_progress'],  # Higher progress first
+            x['full_name']  # Alphabetical
+        ))
+        
+        return Response({
+            'success': True,
+            'department': department_name,
+            'department_id': department_obj.id,
+            'total_mentees': mentees.count(),
+            'eligible_count': len([m for m in ready_mentees_data if m['is_eligible']]),
+            'ready_count': len([m for m in ready_mentees_data if m['onboarding_completed']]),
+            'mentees': ready_mentees_data
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        print(f"Error in get_ready_mentees: {str(e)}")
+        return Response({
+            'error': 'Failed to fetch ready mentees',
+            'detail': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def check_mentee_eligibility(request, mentee_id):
+    """Check if a mentee is eligible for mentorship in a specific department"""
+    try:
+        department_param = request.query_params.get('department')
+        
+        if not department_param:
+            return Response({
+                'error': 'Department parameter is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get the Department object
+        try:
+            # Check if it's a department ID (number)
+            if department_param.isdigit():
+                department_obj = Department.objects.get(id=int(department_param))
+            else:
+                # Treat it as a department name
+                department_obj = Department.objects.get(name=department_param)
+        except Department.DoesNotExist:
+            return Response({
+                'eligible': False,
+                'message': f'Department "{department_param}" not found'
+            }, status=status.HTTP_200_OK)
+        
+        # Get the mentee
+        try:
+            mentee = CustomUser.objects.get(id=mentee_id, role='mentee')
+        except CustomUser.DoesNotExist:
+            return Response({
+                'eligible': False,
+                'message': 'Mentee not found'
+            }, status=status.HTTP_200_OK)
+        
+        from onboarding.models import OnboardingModule, MenteeOnboardingProgress
+        
+        # Check 1: Is mentee in the specified department?
+        if mentee.department != department_obj:
+            return Response({
+                'eligible': False,
+                'message': f'Mentee is not in the {department_obj.name} department'
+            }, status=status.HTTP_200_OK)
+        
+        # Check 2: Has mentee completed all required core modules?
+        required_core_modules = OnboardingModule.objects.filter(
+            module_type='core',
+            is_required=True,
+            is_active=True
+        )
+        
+        incomplete_core_modules = []
+        for module in required_core_modules:
+            progress = MenteeOnboardingProgress.objects.filter(
+                mentee=mentee,
+                module=module
+            ).first()
+            
+            if not progress or progress.status != 'completed':
+                incomplete_core_modules.append(module.title)
+        
+        if incomplete_core_modules:
+            return Response({
+                'eligible': False,
+                'message': f'Mentee must complete core modules: {", ".join(incomplete_core_modules)}',
+                'incomplete_core_modules': incomplete_core_modules
+            }, status=status.HTTP_200_OK)
+        
+        # Check 3: Has mentee completed department-specific modules?
+        required_department_modules = OnboardingModule.objects.filter(
+            module_type='department',
+            departments=department_obj,
+            is_required=True,
+            is_active=True
+        )
+        
+        incomplete_department_modules = []
+        for module in required_department_modules:
+            progress = MenteeOnboardingProgress.objects.filter(
+                mentee=mentee,
+                module=module
+            ).first()
+            
+            if not progress or progress.status != 'completed':
+                incomplete_department_modules.append(module.title)
+        
+        if incomplete_department_modules:
+            return Response({
+                'eligible': False,
+                'message': f'Mentee must complete department modules: {", ".join(incomplete_department_modules)}',
+                'incomplete_department_modules': incomplete_department_modules
+            }, status=status.HTTP_200_OK)
+        
+        # Check 4: Does mentee already have active mentorship in this department?
+        existing_mentorship = Mentorship.objects.filter(
+            mentee=mentee,
+            status__in=['pending', 'active'],
+            program__department=department_obj.name
+        ).first()
+        
+        if existing_mentorship:
+            return Response({
+                'eligible': False,
+                'message': f'Mentee already has an active mentorship with {existing_mentorship.mentor.full_name}',
+                'existing_mentorship': {
+                    'id': existing_mentorship.id,
+                    'mentor': existing_mentorship.mentor.full_name,
+                    'program': existing_mentorship.program.name,
+                    'status': existing_mentorship.status
+                }
+            }, status=status.HTTP_200_OK)
+        
+        # Check 5: Is mentee approved?
+        if mentee.status != 'approved':
+            return Response({
+                'eligible': False,
+                'message': f'Mentee account is {mentee.status}'
+            }, status=status.HTTP_200_OK)
+        
+        # All checks passed
+        return Response({
+            'eligible': True,
+            'message': 'Mentee is eligible for mentorship',
+            'mentee': {
+                'id': mentee.id,
+                'full_name': mentee.full_name,
+                'email': mentee.email,
+                'department': mentee.department.name if mentee.department else None
+            }
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        print(f"Error in check_mentee_eligibility: {str(e)}")
+        return Response({
+            'error': 'Failed to check eligibility',
+            'detail': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def bulk_mentorship_actions(request):
+    """Handle bulk actions on multiple mentorships"""
+    try:
+        if request.user.role not in ['admin', 'hr']:
+            return Response({
+                'error': 'Permission denied. Only Admin and HR can perform bulk actions'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        mentorship_ids = request.data.get('mentorshipIds', [])
+        action = request.data.get('action')
+        
+        if not mentorship_ids:
+            return Response({
+                'error': 'No mentorships selected'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not action:
+            return Response({
+                'error': 'Action is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        valid_actions = ['activate', 'complete', 'pause', 'cancel', 'delete']
+        if action not in valid_actions:
+            return Response({
+                'error': f'Invalid action. Must be one of: {", ".join(valid_actions)}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get the mentorships
+        mentorships = Mentorship.objects.filter(id__in=mentorship_ids)
+        
+        if mentorships.count() != len(mentorship_ids):
+            return Response({
+                'error': 'Some mentorships were not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        updated_count = 0
+        errors = []
+        
+        with transaction.atomic():
+            for mentorship in mentorships:
+                try:
+                    if action == 'activate':
+                        if mentorship.status != 'active':
+                            mentorship.status = 'active'
+                            if not mentorship.start_date:
+                                mentorship.start_date = now().date()
+                            mentorship.save()
+                            updated_count += 1
+                            
+                    elif action == 'complete':
+                        if mentorship.status != 'completed':
+                            mentorship.status = 'completed'
+                            mentorship.actual_end_date = now().date()
+                            mentorship.save()
+                            updated_count += 1
+                            
+                    elif action == 'pause':
+                        if mentorship.status == 'active':
+                            mentorship.status = 'paused'
+                            mentorship.save()
+                            updated_count += 1
+                            
+                    elif action == 'cancel':
+                        if mentorship.status not in ['completed', 'cancelled']:
+                            mentorship.status = 'cancelled'
+                            mentorship.save()
+                            updated_count += 1
+                            
+                    elif action == 'delete':
+                        # Check if mentorship can be deleted
+                        if mentorship.status in ['completed', 'cancelled']:
+                            mentorship.delete()
+                            updated_count += 1
+                        else:
+                            errors.append(f'Mentorship {mentorship.id} cannot be deleted because it is {mentorship.status}')
+                    
+                except Exception as e:
+                    errors.append(f'Error processing mentorship {mentorship.id}: {str(e)}')
+                    continue
+        
+        response_data = {
+            'success': True,
+            'message': f'Bulk action completed. Processed {updated_count} mentorships.',
+            'updated_count': updated_count,
+            'total_selected': len(mentorship_ids)
+        }
+        
+        if errors:
+            response_data['errors'] = errors
+            response_data['has_errors'] = True
+        
+        return Response(response_data, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        return Response({
+            'error': 'Failed to perform bulk action',
+            'detail': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+
+
+
+
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def switch_current_program(request, mentorship_id, program_id):
+    """Switch to a different program within the department"""
+    try:
+        mentorship = get_object_or_404(Mentorship, id=mentorship_id)
+        new_program = get_object_or_404(MentorshipProgram, id=program_id)
+        
+        # Check if program belongs to mentorship's department
+        if new_program.department != mentorship.department.name:
+            return Response({
+                'error': 'Program does not belong to mentorship department'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Check if program is in mentorship's programs list
+        if not mentorship.programs.filter(id=program_id).exists():
+            return Response({
+                'error': 'Program not assigned to this mentorship'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Switch current program
+        mentorship.current_program = new_program
+        mentorship.save()
+        
+        return Response({
+            'success': True,
+            'message': f'Switched to program: {new_program.name}',
+            'current_program': MentorshipProgramSerializer(new_program).data
+        }, status=status.HTTP_200_OK)
+    
+    except Exception as e:
+        return Response({
+            'error': 'Failed to switch program',
+            'detail': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+
+
+        

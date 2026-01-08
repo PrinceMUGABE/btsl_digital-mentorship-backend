@@ -113,10 +113,12 @@ def generate_secure_password():
 
 # ==================== AUTHENTICATION VIEWS ====================
 
+
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def register_user(request):
-    """Register user with role-based department validation."""
+    
     try:
         print(f"\n{'='*50}")
         print(f"REGISTRATION REQUEST RECEIVED")
@@ -127,7 +129,7 @@ def register_user(request):
         phone_number = request.data.get('phone_number', '').strip()
         email = request.data.get('email', '').strip()
         full_name = request.data.get('full_name', '').strip()
-        department = request.data.get('department', '').strip()
+        department = request.data.get('department', '').strip() or None
         departments = request.data.get('departments', [])  # For mentors
         role = request.data.get('role', 'mentee').strip().lower()
         requesting_user = request.user if request.user.is_authenticated else None
@@ -271,31 +273,57 @@ def register_user(request):
             print(traceback.format_exc())
             return Response({"error": "Failed to generate work email address. Please try again."}, status=500)
         
-        # Create user
+        # Create user with proper parameters based on role
         try:
-            # For mentee, pass department ID; for mentor, pass None (use M2M later)
-            dept_for_creation = department if role == 'mentee' else None
-            
-            user = CustomUser.objects.create_user(
-                phone_number=phone_number,
-                email=email,
-                full_name=full_name,
-                department=dept_for_creation,
-                role=role,
-                work_mail_address=work_mail_address,
-                password=password,
-                created_by=requesting_user,
-                status='approved' if requesting_user else 'pending',
-                availability_status='active' if requesting_user else 'inactive'
-            )
-            
-            # For mentors, set multiple departments
-            if role == 'mentor' and departments:
-                user.departments.set(departments)
-                print(f"Set {len(departments)} departments for mentor: {user.full_name}")
+            if role == 'mentee':
+                user = CustomUser.objects.create_user(
+                    phone_number=phone_number,
+                    email=email,
+                    full_name=full_name,
+                    department=department,  # Pass department ID for mentee
+                    departments=None,
+                    role=role,
+                    work_mail_address=work_mail_address,
+                    password=password,
+                    created_by=requesting_user,
+                    status='approved' if requesting_user else 'pending',
+                    availability_status='active' if requesting_user else 'inactive'
+                )
+            elif role == 'mentor':
+                user = CustomUser.objects.create_user(
+                    phone_number=phone_number,
+                    email=email,
+                    full_name=full_name,
+                    department=None,
+                    departments=departments,  # Pass departments list for mentor
+                    role=role,
+                    work_mail_address=work_mail_address,
+                    password=password,
+                    created_by=requesting_user,
+                    status='approved' if requesting_user else 'pending',
+                    availability_status='active' if requesting_user else 'inactive'
+                )
+            else:  # admin or hr
+                user = CustomUser.objects.create_user(
+                    phone_number=phone_number,
+                    email=email,
+                    full_name=full_name,
+                    department=None,
+                    departments=None,
+                    role=role,
+                    work_mail_address=work_mail_address,
+                    password=password,
+                    created_by=requesting_user,
+                    status='approved' if requesting_user else 'pending',
+                    availability_status='active' if requesting_user else 'inactive'
+                )
             
             print(f"SUCCESS: User created with ID: {user.id}")
             print(f"User details: {user.full_name} - {user.work_mail_address}")
+            
+            if role == 'mentor':
+                print(f"Mentor departments: {[d.name for d in user.departments.all()]}")
+                
         except IntegrityError as e:
             error_msg = f"Database integrity error: A user with this information already exists."
             print(f"ERROR: {error_msg}")
@@ -321,51 +349,59 @@ def register_user(request):
             
             subject = "Welcome to BTSL Mentorship System"
             message = f"""
-Hello {full_name},
+        Hello {full_name},
 
-Your account has been successfully created in the BTSL Mentorship System.
+        Your account has been successfully created in the BTSL Mentorship System.
 
-Account Details:
-- Full Name: {full_name}
-- Role: {role.title()}
-- {dept_info}
-- Work Email: {work_mail_address}
-- Personal Email: {email}
-- Password: {password}
+        Account Details:
+        - Full Name: {full_name}
+        - Role: {role.title()}
+            - {dept_info}
+            - Work Email: {work_mail_address}
+            - Personal Email: {email}
+            - Password: {password}
 
-Please use your work email ({work_mail_address}) to log in to the system.
+            Please use your work email ({work_mail_address}) to log in to the system.
 
-Important: This is a system-generated password. For security reasons, please change it after your first login.
+            Important: This is a system-generated password. For security reasons, please change it after your first login.
 
-If you have any questions, please contact our support team.
+            If you have any questions, please contact our support team.
 
-Best regards,
-BTSL Mentorship Team
-            """
-            
+            Best regards,
+            BTSL Mentorship Team
+                        """
+                        
             send_mail(
-                subject=subject,
-                message=message,
-                from_email="no-reply@btsl_mentorship.com",
-                recipient_list=[email],
-                fail_silently=False,
-            )
+                            subject=subject,
+                            message=message,
+                            from_email="no-reply@btsl_mentorship.com",
+                            recipient_list=[email],
+                            fail_silently=False,
+                        )
             print(f"SUCCESS: Email sent to {email}")
         except Exception as e:
             error_msg = f"Warning: User created but email failed to send: {str(e)}"
             print(f"WARNING: {error_msg}")
-        
-        success_msg = "User registered successfully. Please check your email for login credentials."
-        print(f"SUCCESS: {success_msg}")
-        print(f"{'='*50}\n")
-        
-        return Response({
-            "message": success_msg,
-            "work_mail_address": work_mail_address,
-            "status": user.status,
-            "role": user.role
-        }, status=201)
-        
+                    
+            success_msg = "User registered successfully. Please check your email for login credentials."
+            print(f"SUCCESS: {success_msg}")
+            print(f"{'='*50}\n")
+                    
+            return Response({
+                        "message": success_msg,
+                        "work_mail_address": work_mail_address,
+                        "status": user.status,
+                        "role": user.role
+                    }, status=201)
+                    
+        except Exception as e:
+                    error_msg = f"Unexpected error during registration: {str(e)}"
+                    print(f"CRITICAL ERROR: {error_msg}")
+                    print(traceback.format_exc())
+                    return Response({
+                        "error": "An unexpected error occurred during registration. Please try again or contact support."
+                    }, status=500)
+
     except Exception as e:
         error_msg = f"Unexpected error during registration: {str(e)}"
         print(f"CRITICAL ERROR: {error_msg}")
@@ -373,8 +409,6 @@ BTSL Mentorship Team
         return Response({
             "error": "An unexpected error occurred during registration. Please try again or contact support."
         }, status=500)
-
-
 
 @api_view(['POST'])
 @authentication_classes([])
@@ -536,7 +570,8 @@ def update_user(request, user_id):
         # Role-based department validation
         if role:
             if role == 'mentee':
-                if not department:
+                # Mentee must have exactly one department
+                if department is None:
                     print("ERROR: Mentee users must have a department assigned.")
                     return Response({
                         "error": "Mentee users must have a department assigned."
@@ -545,7 +580,8 @@ def update_user(request, user_id):
                 try:
                     dept_obj = Department.objects.get(id=department, status='active')
                     target_user.department = dept_obj
-                    target_user.departments.clear()  # Clear M2M if exists
+                    # Clear M2M departments for mentee
+                    # We'll do this after save to avoid issues
                 except Department.DoesNotExist:
                     print("ERROR: Invalid or inactive department selected.")
                     return Response({
@@ -553,6 +589,7 @@ def update_user(request, user_id):
                     }, status=400)
             
             elif role == 'mentor':
+                # Mentor must have at least one department
                 if not departments or len(departments) == 0:
                     print("ERROR: Mentor users must have at least one department assigned.")
                     return Response({
@@ -566,14 +603,46 @@ def update_user(request, user_id):
                         "error": "One or more selected departments are invalid or inactive."
                     }, status=400)
                 
-                target_user.department = None  # Clear FK
-                # Don't call .set() until after save
+                # Clear FK department for mentor
+                target_user.department = None
             
             elif role in ['admin', 'hr']:
+                # Admin/HR don't have departments
                 target_user.department = None
-                # Don't clear M2M until after save
             
             target_user.role = role
+        
+        # If department is being updated without role change
+        elif 'department' in request.data and target_user.role == 'mentee':
+            if department is None:
+                print("ERROR: Mentee users must have a department assigned.")
+                return Response({
+                    "error": "Mentee users must have a department assigned."
+                }, status=400)
+            
+            try:
+                dept_obj = Department.objects.get(id=department, status='active')
+                target_user.department = dept_obj
+            except Department.DoesNotExist:
+                print("ERROR: Invalid or inactive department selected.")
+                return Response({
+                    "error": "Invalid or inactive department selected."
+                }, status=400)
+        
+        # If departments are being updated without role change
+        elif 'departments' in request.data and target_user.role == 'mentor':
+            if not departments or len(departments) == 0:
+                print("ERROR: Mentor users must have at least one department assigned.")
+                return Response({
+                    "error": "Mentor users must have at least one department assigned."
+                }, status=400)
+            
+            valid_depts = Department.objects.filter(id__in=departments, status='active')
+            if valid_depts.count() != len(departments):
+                print("ERROR: One or more selected departments are invalid or inactive.")
+                return Response({
+                    "error": "One or more selected departments are invalid or inactive."
+                }, status=400)
         
         # Update other fields
         if phone_number:
@@ -590,14 +659,18 @@ def update_user(request, user_id):
         # Save with skip_validation to avoid full_clean() issues
         target_user.save(skip_validation=True)
         
-        # Now update M2M relationships after save
-        if role == 'mentor' and departments:
-            target_user.departments.set(Department.objects.filter(id__in=departments, status='active'))
-            print(f"SUCCESS: Updated mentor with {len(departments)} departments")
-        elif role == 'mentee':
+        # Now update M2M relationships after save based on role
+        if target_user.role == 'mentor':
+            if 'departments' in request.data:
+                # Update mentor departments
+                target_user.departments.set(Department.objects.filter(id__in=departments, status='active'))
+                print(f"SUCCESS: Updated mentor with {len(departments)} departments")
+        elif target_user.role == 'mentee':
+            # Clear M2M departments for mentee (they use FK)
             target_user.departments.clear()
             print("SUCCESS: Cleared M2M departments for mentee")
-        elif role in ['admin', 'hr']:
+        elif target_user.role in ['admin', 'hr']:
+            # Clear both FK and M2M for admin/hr
             target_user.departments.clear()
             print("SUCCESS: Cleared departments for admin/hr")
         
@@ -619,7 +692,8 @@ def update_user(request, user_id):
         import traceback
         print(traceback.format_exc())
         return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=500)
-
+    
+    
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def list_all_users(request):
@@ -629,6 +703,33 @@ def list_all_users(request):
     
     users = CustomUser.objects.all()
     serializer = CustomUserSerializer(users, many=True)
+    return Response({"users": serializer.data}, status=200)
+
+
+
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_all_mentors(request):
+    """List all mentors with proper permissions."""
+    if not request.user.is_admin and not request.user.is_hr:
+        return Response({"error": "You are not authorized to view all mentors."}, status=403)
+
+    mentors = CustomUser.objects.filter(role='mentor')
+    serializer = CustomUserSerializer(mentors, many=True)
+    return Response({"users": serializer.data}, status=200)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_all_mentees(request):
+    """List all mentees with proper permissions."""
+    if not request.user.is_admin and not request.user.is_hr:
+        return Response({"error": "You are not authorized to view all mentees."}, status=403)
+
+    mentees = CustomUser.objects.filter(role='mentee')
+    serializer = CustomUserSerializer(mentees, many=True)
     return Response({"users": serializer.data}, status=200)
 
 
@@ -1153,3 +1254,320 @@ BTSL Digital Mentorship Team
             "error": "An unexpected error occurred. Please try again.",
             "detail": str(e)
         }, status=500)
+    
+
+
+
+
+
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def users_list_create(request):
+    """
+    GET: List all users (admin/HR only)
+    POST: Create new user (admin/HR only)
+    """
+    # Check permissions for both methods
+    if not request.user.is_admin and not request.user.is_hr:
+        return Response({
+            "error": "You are not authorized to perform this action."
+        }, status=403)
+    
+    if request.method == 'GET':
+        users = CustomUser.objects.all()
+        serializer = CustomUserSerializer(users, many=True)
+        return Response({"users": serializer.data}, status=200)
+    
+    elif request.method == 'POST':
+        try:
+            print(f"\n{'='*50}")
+            print(f"REGISTRATION REQUEST RECEIVED")
+            print(f"{'='*50}")
+            print(f"Submitted data: {request.data}\n")
+            
+            # Extract data
+            phone_number = request.data.get('phone_number', '').strip()
+            email = request.data.get('email', '').strip()
+            full_name = request.data.get('full_name', '').strip()
+            department = request.data.get('department', '').strip() or None
+            departments = request.data.get('departments', [])  # For mentors
+            role = request.data.get('role', 'mentee').strip().lower()
+            requesting_user = request.user if request.user.is_authenticated else None
+            
+            # Validate required fields
+            if not phone_number:
+                error_msg = "Phone number is required."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            if not email:
+                error_msg = "Email address is required."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            if not full_name:
+                error_msg = "Full name is required."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            # Validate phone number format
+            phone_error = is_valid_phone(phone_number)
+            if phone_error:
+                print(f"ERROR: {phone_error}")
+                return Response({"error": phone_error}, status=400)
+            
+            # Validate email format
+            email_error = is_valid_email(email)
+            if email_error:
+                print(f"ERROR: {email_error}")
+                return Response({"error": email_error}, status=400)
+            
+            # Check role-based permissions
+            if role not in ['admin', 'mentor', 'mentee', 'hr']:
+                error_msg = f"Invalid role '{role}'. Must be one of: admin, mentor, mentee, hr"
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            # Department validation based on role
+            if role == 'mentee':
+                if not department:
+                    error_msg = "Department is required for mentee users."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=400)
+                
+                # Validate department exists and is active
+                try:
+                    dept_obj = Department.objects.get(id=department, status='active')
+                except Department.DoesNotExist:
+                    error_msg = "Invalid or inactive department selected."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=400)
+            
+            elif role == 'mentor':
+                if not departments or len(departments) == 0:
+                    error_msg = "At least one department is required for mentor users."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=400)
+                
+                # Validate all departments exist and are active
+                valid_depts = Department.objects.filter(id__in=departments, status='active')
+                if valid_depts.count() != len(departments):
+                    error_msg = "One or more selected departments are invalid or inactive."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=400)
+            
+            elif role in ['admin', 'hr']:
+                # Admin and HR don't require departments
+                department = None
+                departments = []
+            
+            # Role-based permission checks
+            if role != 'mentee' and not requesting_user:
+                error_msg = "Only admin or HR can create users with roles other than 'mentee'."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            if requesting_user:
+                if role == 'admin' and not requesting_user.is_admin:
+                    error_msg = "Only admin can create admin users."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=403)
+                if role == 'hr' and not requesting_user.is_admin:
+                    error_msg = "Only admin can create HR users."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=403)
+                if role == 'mentor' and not (requesting_user.is_admin or requesting_user.is_hr):
+                    error_msg = "Only admin or HR can create mentor users."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=403)
+            
+            # Check for existing users
+            if CustomUser.objects.filter(phone_number=phone_number).exists():
+                error_msg = "A user with this phone number already exists."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            if CustomUser.objects.filter(email=email).exists():
+                error_msg = "A user with this email already exists."
+                print(f"ERROR: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            # Handle password
+            if requesting_user:
+                password = generate_secure_password()
+                if not password:
+                    error_msg = "Failed to generate secure password. Please try again."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=500)
+            else:
+                password = request.data.get('password', '').strip()
+                confirm_password = request.data.get('confirm_password', '').strip()
+                
+                if not password:
+                    error_msg = "Password is required."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=400)
+                
+                if not confirm_password:
+                    error_msg = "Password confirmation is required."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=400)
+                
+                if password != confirm_password:
+                    error_msg = "Passwords do not match."
+                    print(f"ERROR: {error_msg}")
+                    return Response({"error": error_msg}, status=400)
+                
+                password_error = is_valid_password(password)
+                if password_error:
+                    print(f"ERROR: {password_error}")
+                    return Response({"error": password_error}, status=400)
+            
+            # Generate work mail address
+            try:
+                work_mail_address = CustomUser.objects.generate_work_mail(full_name, role)
+                print(f"Generated work email: {work_mail_address}")
+            except Exception as e:
+                error_msg = f"Failed to generate work email address: {str(e)}"
+                print(f"ERROR: {error_msg}")
+                print(traceback.format_exc())
+                return Response({"error": "Failed to generate work email address. Please try again."}, status=500)
+            
+            # Create user with proper parameters based on role
+            try:
+                if role == 'mentee':
+                    user = CustomUser.objects.create_user(
+                        phone_number=phone_number,
+                        email=email,
+                        full_name=full_name,
+                        department=department,  # Pass department ID for mentee
+                        departments=None,
+                        role=role,
+                        work_mail_address=work_mail_address,
+                        password=password,
+                        created_by=requesting_user,
+                        status='approved' if requesting_user else 'pending',
+                        availability_status='active' if requesting_user else 'inactive'
+                    )
+                elif role == 'mentor':
+                    user = CustomUser.objects.create_user(
+                        phone_number=phone_number,
+                        email=email,
+                        full_name=full_name,
+                        department=None,
+                        departments=departments,  # Pass departments list for mentor
+                        role=role,
+                        work_mail_address=work_mail_address,
+                        password=password,
+                        created_by=requesting_user,
+                        status='approved' if requesting_user else 'pending',
+                        availability_status='active' if requesting_user else 'inactive'
+                    )
+                else:  # admin or hr
+                    user = CustomUser.objects.create_user(
+                        phone_number=phone_number,
+                        email=email,
+                        full_name=full_name,
+                        department=None,
+                        departments=None,
+                        role=role,
+                        work_mail_address=work_mail_address,
+                        password=password,
+                        created_by=requesting_user,
+                        status='approved' if requesting_user else 'pending',
+                        availability_status='active' if requesting_user else 'inactive'
+                    )
+                
+                print(f"SUCCESS: User created with ID: {user.id}")
+                print(f"User details: {user.full_name} - {user.work_mail_address}")
+                
+                if role == 'mentor':
+                    print(f"Mentor departments: {[d.name for d in user.departments.all()]}")
+                    
+            except IntegrityError as e:
+                error_msg = f"Database integrity error: A user with this information already exists."
+                print(f"ERROR: {error_msg}")
+                print(f"IntegrityError details: {str(e)}")
+                return Response({"error": "A user with this information already exists."}, status=400)
+            except Exception as e:
+                error_msg = f"Error creating user: {str(e)}"
+                print(f"ERROR: {error_msg}")
+                print(traceback.format_exc())
+                return Response({"error": "Failed to create user account. Please try again."}, status=500)
+            
+            # Send email with credentials
+            try:
+                # Get department info for email
+                dept_info = ""
+                if role == 'mentee':
+                    dept_info = f"Department: {user.department.name}"
+                elif role == 'mentor':
+                    dept_names = [d.name for d in user.departments.all()]
+                    dept_info = f"Departments: {', '.join(dept_names)}"
+                else:
+                    dept_info = "Department: N/A (Admin/HR)"
+                
+                subject = "Welcome to BTSL Mentorship System"
+                message = f"""
+            Hello {full_name},
+
+            Your account has been successfully created in the BTSL Mentorship System.
+
+            Account Details:
+            - Full Name: {full_name}
+            - Role: {role.title()}
+                - {dept_info}
+                - Work Email: {work_mail_address}
+                - Personal Email: {email}
+                - Password: {password}
+
+                Please use your work email ({work_mail_address}) to log in to the system.
+
+                Important: This is a system-generated password. For security reasons, please change it after your first login.
+
+                If you have any questions, please contact our support team.
+
+                Best regards,
+                BTSL Mentorship Team
+                            """
+                            
+                send_mail(
+                                subject=subject,
+                                message=message,
+                                from_email="no-reply@btsl_mentorship.com",
+                                recipient_list=[email],
+                                fail_silently=False,
+                            )
+                print(f"SUCCESS: Email sent to {email}")
+            except Exception as e:
+                error_msg = f"Warning: User created but email failed to send: {str(e)}"
+                print(f"WARNING: {error_msg}")
+                        
+                success_msg = "User registered successfully. Please check your email for login credentials."
+                print(f"SUCCESS: {success_msg}")
+                print(f"{'='*50}\n")
+                        
+                return Response({
+                            "message": success_msg,
+                            "work_mail_address": work_mail_address,
+                            "status": user.status,
+                            "role": user.role
+                        }, status=201)
+                        
+            except Exception as e:
+                        error_msg = f"Unexpected error during registration: {str(e)}"
+                        print(f"CRITICAL ERROR: {error_msg}")
+                        print(traceback.format_exc())
+                        return Response({
+                            "error": "An unexpected error occurred during registration. Please try again or contact support."
+                        }, status=500)
+
+        except Exception as e:
+            error_msg = f"Unexpected error during registration: {str(e)}"
+            print(f"CRITICAL ERROR: {error_msg}")
+            print(traceback.format_exc())
+            return Response({
+                "error": "An unexpected error occurred during registration. Please try again or contact support."
+            }, status=500)

@@ -60,11 +60,18 @@ class OnboardingModule(models.Model):
             return [dept.name for dept in departments]
         return ['No Departments']
     
-    def is_applicable_to_department(self, department_name):
+    def is_applicable_to_department(self, department):
         """Check if module applies to specific department"""
         if self.module_type == 'core':
             return True
-        return self.departments.filter(name=department_name).exists()
+        
+        # Handle both Department object, department ID, and department name
+        if isinstance(department, int):
+            return self.departments.filter(id=department).exists()
+        elif isinstance(department, str):
+            return self.departments.filter(name=department).exists()
+        else:
+            return self.departments.filter(id=department.id).exists()
     
     def calculate_days_to_complete(self):
         """Calculate estimated days to complete based on duration"""
@@ -94,25 +101,33 @@ class OnboardingModule(models.Model):
         )
         
         if department:
-            completed_progress = completed_progress.filter(mentee__department=department)
+            # Handle both Department object and department ID
+            if isinstance(department, int):
+                completed_progress = completed_progress.filter(mentee__department_id=department)
+            else:
+                completed_progress = completed_progress.filter(mentee__department=department)
         
         if completed_progress.exists():
             avg_time = completed_progress.aggregate(
                 avg_time=Avg('time_spent_minutes')
             )['avg_time']
-            return round(avg_time, 1)
+            return round(avg_time, 1) if avg_time else None
         return None
-    
     def get_department_stats(self):
         """Get statistics by department"""
         departments = self.departments.all()
         stats = []
         
         for department in departments:
-            dept_progress = self.mentee_progress.filter(mentee__department=department.name)
+            # FIXED: Use department FK relationship properly
+            dept_progress = self.mentee_progress.filter(mentee__department=department)
             total = dept_progress.count()
             completed = dept_progress.filter(status='completed').count()
             completion_rate = round((completed / total * 100), 2) if total > 0 else 0
+            
+            # Calculate average time spent, handling None values
+            avg_time_result = dept_progress.aggregate(avg=Avg('time_spent_minutes'))
+            avg_time = avg_time_result['avg'] if avg_time_result['avg'] is not None else 0
             
             stats.append({
                 'department_id': department.id,
@@ -120,9 +135,7 @@ class OnboardingModule(models.Model):
                 'total_assigned': total,
                 'completed': completed,
                 'completion_rate': completion_rate,
-                'avg_time_spent': dept_progress.aggregate(
-                    avg=Avg('time_spent_minutes')
-                )['avg'] or 0
+                'avg_time_spent': round(avg_time, 2)
             })
         
         return stats
@@ -230,6 +243,59 @@ class MenteeOnboardingProgress(models.Model):
     def get_department(self):
         """Get mentee's department"""
         return self.mentee.department
+    
+    def mark_as_started(self):
+        """Mark module as started"""
+        if not self.started_at:
+            self.started_at = now()
+            self.status = 'in_progress'
+            self.save()
+    
+    def mark_as_completed(self):
+        """Mark module as completed"""
+        if self.status != 'completed':
+            self.status = 'completed'
+            self.progress_percentage = 100
+            self.completed_at = now()
+            self.save()
+    
+    def update_progress(self, percentage):
+        """Update progress percentage"""
+        if 0 <= percentage <= 100:
+            self.progress_percentage = percentage
+            
+            # Auto-start if not started
+            if not self.started_at and percentage > 0:
+                self.started_at = now()
+            
+            # Auto-complete if 100%
+            if percentage == 100:
+                self.status = 'completed'
+                self.completed_at = now()
+            elif percentage > 0:
+                self.status = 'in_progress'
+            
+            self.save()
+    
+    def add_time_spent(self, minutes):
+        """Add time spent on module"""
+        if minutes > 0:
+            self.time_spent_minutes += minutes
+            self.save()
+    
+    def is_overdue(self):
+        """Check if module is overdue"""
+        if self.due_date and self.status != 'completed':
+            return now() > self.due_date
+        return False
+    
+    def get_progress_speed(self):
+        """Calculate progress speed (percentage per day)"""
+        if self.started_at and self.progress_percentage > 0:
+            days_elapsed = (now() - self.started_at).days
+            if days_elapsed > 0:
+                return round(self.progress_percentage / days_elapsed, 2)
+        return 0
 
 
 class OnboardingChecklist(models.Model):
@@ -256,21 +322,23 @@ class OnboardingChecklist(models.Model):
     def __str__(self):
         return f"{self.module.title} - {self.title}"
     
-    def get_completion_rate(self, mentee=None):
-        """Get completion rate for this checklist item"""
-        completions = self.mentee_completions.filter(is_completed=True)
+    def get_completion_rate(self, department=None):
+        """Get completion rate for this module, optionally filtered by department"""
+        progress_query = self.mentee_progress.all()
         
-        if mentee:
-            completions = completions.filter(mentee=mentee)
-            return completions.exists()  # Return boolean for specific mentee
+        if department:
+            # Handle both Department object and department ID
+            if isinstance(department, int):
+                progress_query = progress_query.filter(mentee__department_id=department)
+            else:
+                progress_query = progress_query.filter(mentee__department=department)
         
-        total_assigned = self.module.mentee_progress.count()
+        total_assigned = progress_query.count()
         if total_assigned == 0:
             return 0
         
-        completed_count = completions.count()
-        return round((completed_count / total_assigned) * 100, 2)
-
+        completed = progress_query.filter(status='completed').count()
+        return round((completed / total_assigned) * 100, 2)
 
 class MenteeChecklistProgress(models.Model):
     """Track individual checklist item completion"""

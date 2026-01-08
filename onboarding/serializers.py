@@ -1,3 +1,5 @@
+# onboarding/serializers.py - Fixed version
+
 from rest_framework import serializers
 from .models import (
     OnboardingModule, 
@@ -29,8 +31,15 @@ class OnboardingChecklistSerializer(serializers.ModelSerializer):
             'estimated_minutes'
         ]
 
+
 class OnboardingModuleCreateSerializer(serializers.ModelSerializer):
     checklist_items = OnboardingChecklistSerializer(many=True, required=False)
+    departments = serializers.PrimaryKeyRelatedField(
+        many=True, 
+        queryset=Department.objects.filter(status='active'),
+        required=False,
+        write_only=True
+    )
     
     class Meta:
         model = OnboardingModule
@@ -38,7 +47,7 @@ class OnboardingModuleCreateSerializer(serializers.ModelSerializer):
             'title',
             'description',
             'module_type',
-            'department',
+            'departments',
             'order',
             'is_required',
             'duration_minutes',
@@ -50,7 +59,13 @@ class OnboardingModuleCreateSerializer(serializers.ModelSerializer):
     
     def create(self, validated_data):
         checklist_items_data = validated_data.pop('checklist_items', [])
+        departments_data = validated_data.pop('departments', [])
+        
         module = OnboardingModule.objects.create(**validated_data)
+        
+        # Add departments if provided
+        if departments_data:
+            module.departments.set(departments_data)
         
         # Create checklist items
         for item_data in checklist_items_data:
@@ -60,23 +75,42 @@ class OnboardingModuleCreateSerializer(serializers.ModelSerializer):
     
     def update(self, instance, validated_data):
         checklist_items_data = validated_data.pop('checklist_items', None)
+        departments_data = validated_data.pop('departments', None)
         
         # Update module fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
         
+        # Update departments if provided
+        if departments_data is not None:
+            instance.departments.set(departments_data)
+        
         # Update checklist items if provided
         if checklist_items_data is not None:
-            # Remove existing checklist items
             instance.checklist_items.all().delete()
-            
-            # Create new checklist items
             for item_data in checklist_items_data:
                 OnboardingChecklist.objects.create(module=instance, **item_data)
         
         return instance
     
+    def validate(self, data):
+        """Validate module data"""
+        module_type = data.get('module_type')
+        departments = data.get('departments', [])
+        
+        # For core modules, clear departments
+        if module_type == 'core':
+            data['departments'] = []
+        # For department modules, ensure at least one department is selected
+        elif module_type == 'department' and not departments:
+            raise serializers.ValidationError({
+                'departments': 'At least one department is required for department-specific modules'
+            })
+        
+        return data
+
+
 class OnboardingModuleSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.full_name', read_only=True)
     applicable_departments = serializers.SerializerMethodField()
@@ -135,17 +169,11 @@ class OnboardingModuleSerializer(serializers.ModelSerializer):
         module_type = data.get('module_type')
         department_ids = data.get('department_ids', [])
         
-        if module_type == 'department' and not department_ids:
-            raise serializers.ValidationError({
-                'department_ids': 'Department IDs are required for department-specific modules'
-            })
-        
         # Clear departments for core modules
         if module_type == 'core':
             data['department_ids'] = []
-        
-        # Validate department IDs exist
-        if department_ids:
+        # For department modules, validate department IDs
+        elif module_type == 'department' and department_ids:
             existing_dept_ids = Department.objects.filter(
                 id__in=department_ids,
                 status='active'
@@ -165,8 +193,8 @@ class OnboardingModuleSerializer(serializers.ModelSerializer):
         
         module = OnboardingModule.objects.create(**validated_data)
         
-        # Add departments
-        if department_ids:
+        # Add departments if provided (only for department modules)
+        if department_ids and module.module_type == 'department':
             departments = Department.objects.filter(id__in=department_ids)
             module.departments.set(departments)
         
@@ -187,7 +215,7 @@ class OnboardingModuleSerializer(serializers.ModelSerializer):
         
         # Update departments if provided
         if department_ids is not None:
-            if department_ids:
+            if department_ids and instance.module_type == 'department':
                 departments = Department.objects.filter(id__in=department_ids)
                 instance.departments.set(departments)
             else:
@@ -202,11 +230,10 @@ class OnboardingModuleSerializer(serializers.ModelSerializer):
         return instance
 
 
-
 class MenteeOnboardingProgressSerializer(serializers.ModelSerializer):
     mentee_name = serializers.CharField(source='mentee.full_name', read_only=True)
     mentee_email = serializers.CharField(source='mentee.email', read_only=True)
-    mentee_department = serializers.CharField(source='mentee.department', read_only=True)
+    mentee_department = serializers.SerializerMethodField()
     module_title = serializers.CharField(source='module.title', read_only=True)
     module_description = serializers.CharField(source='module.description', read_only=True)
     module_type = serializers.CharField(source='module.module_type', read_only=True)
@@ -234,13 +261,21 @@ class MenteeOnboardingProgressSerializer(serializers.ModelSerializer):
             'progress_percentage',
             'started_at',
             'completed_at',
+            'due_date',
             'notes',
             'time_spent_minutes',
             'checklist_progress'
         ]
         read_only_fields = ['started_at', 'completed_at']
     
+    def get_mentee_department(self, obj):
+        """Get mentee's department name - Fixed for ForeignKey"""
+        if obj.mentee.department:
+            return obj.mentee.department.name
+        return None
+    
     def get_checklist_progress(self, obj):
+        """Get checklist progress for this module"""
         checklist_items = obj.module.checklist_items.all()
         progress_items = MenteeChecklistProgress.objects.filter(
             mentee=obj.mentee,
@@ -255,8 +290,10 @@ class MenteeOnboardingProgressSerializer(serializers.ModelSerializer):
                 'title': item.title,
                 'description': item.description,
                 'is_required': item.is_required,
+                'estimated_minutes': item.estimated_minutes,
                 'is_completed': progress.is_completed if progress else False,
-                'completed_at': progress.completed_at if progress else None
+                'completed_at': progress.completed_at if progress else None,
+                'time_spent_minutes': progress.time_spent_minutes if progress else 0
             })
         
         return result
@@ -278,9 +315,9 @@ class MenteeOnboardingProgressUpdateSerializer(serializers.ModelSerializer):
         return value
 
 
-
 class MenteeSummarySerializer(serializers.ModelSerializer):
     """Summary of mentee's overall onboarding progress"""
+    department_name = serializers.SerializerMethodField()
     total_modules = serializers.SerializerMethodField()
     completed_modules = serializers.SerializerMethodField()
     in_progress_modules = serializers.SerializerMethodField()
@@ -294,12 +331,19 @@ class MenteeSummarySerializer(serializers.ModelSerializer):
             'full_name',
             'email',
             'department',
+            'department_name',
             'total_modules',
             'completed_modules',
             'in_progress_modules',
             'not_started_modules',
             'overall_progress_percentage'
         ]
+    
+    def get_department_name(self, obj):
+        """Get department name - Fixed for ForeignKey"""
+        if obj.department:
+            return obj.department.name
+        return None
     
     def get_total_modules(self, obj):
         return obj.onboarding_progress.count()
@@ -320,7 +364,6 @@ class MenteeSummarySerializer(serializers.ModelSerializer):
         
         total_progress = sum(p.progress_percentage for p in progress_records)
         return round(total_progress / progress_records.count(), 2)
-    
 
 
 class MenteeChecklistProgressSerializer(serializers.ModelSerializer):
@@ -335,10 +378,12 @@ class MenteeChecklistProgressSerializer(serializers.ModelSerializer):
             'checklist_item_title',
             'checklist_item_description',
             'is_completed',
-            'completed_at'
+            'completed_at',
+            'time_spent_minutes',
+            'notes'
         ]
 
-        
+
 class DepartmentProgressSerializer(serializers.Serializer):
     """Serializer for department-wise progress summary"""
     department_id = serializers.IntegerField()
@@ -363,49 +408,10 @@ class DepartmentModuleStatsSerializer(serializers.Serializer):
     avg_time_spent = serializers.FloatField()
 
 
-# Update MenteeOnboardingProgressSerializer to include department
-class MenteeOnboardingProgressSerializer(serializers.ModelSerializer):
-    mentee_name = serializers.CharField(source='mentee.full_name', read_only=True)
-    mentee_email = serializers.CharField(source='mentee.email', read_only=True)
-    mentee_department = serializers.CharField(source='mentee.department', read_only=True)
-    module_title = serializers.CharField(source='module.title', read_only=True)
-    module_description = serializers.CharField(source='module.description', read_only=True)
-    module_type = serializers.CharField(source='module.module_type', read_only=True)
-    module_duration = serializers.IntegerField(source='module.duration_minutes', read_only=True)
-    module_content = serializers.JSONField(source='module.content', read_only=True)
-    module_resources = serializers.JSONField(source='module.resources', read_only=True)
-    checklist_progress = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = MenteeOnboardingProgress
-        fields = [
-            'id',
-            'mentee',
-            'mentee_name',
-            'mentee_email',
-            'mentee_department',
-            'module',
-            'module_title',
-            'module_description',
-            'module_type',
-            'module_duration',
-            'module_content',
-            'module_resources',
-            'status',
-            'progress_percentage',
-            'started_at',
-            'completed_at',
-            'notes',
-            'time_spent_minutes',
-            'checklist_progress'
-        ]
-        read_only_fields = ['started_at', 'completed_at']
-
-
-# Add new serializer for department summaries
 class DepartmentSummarySerializer(serializers.Serializer):
     """Summary of onboarding progress for a department"""
-    department = serializers.CharField()
+    department_id = serializers.IntegerField()
+    department_name = serializers.CharField()
     total_mentees = serializers.IntegerField()
     total_modules_assigned = serializers.IntegerField()
     completed_modules = serializers.IntegerField()
@@ -413,10 +419,6 @@ class DepartmentSummarySerializer(serializers.Serializer):
     average_progress_per_mentee = serializers.FloatField()
     mentees_behind_schedule = serializers.IntegerField()
     modules_requiring_attention = serializers.ListField(child=serializers.CharField())
-
-
-
-
 
 
 class SendReminderSerializer(serializers.Serializer):

@@ -12,12 +12,14 @@ urlpatterns = [
     
     
     # Users resource (admin/HR)
-    path('users/', views.list_all_users, name='users-list'),
+    path('users/', views.users_list_create, name='users-list-create'),
     path('users/<int:user_id>/', views.get_user_by_id, name='users-detail'),
     path('users/<int:user_id>/update/', views.update_user, name='users-update'),
     path('users/<int:user_id>/delete/', views.delete_or_deactivate_user, name='users-delete'),
     path('users/search/email/', views.get_user_by_email, name='users-search-email'),
     path('users/search/phone/', views.get_user_by_phone, name='users-search-phone'),
+    path('users/mentors/', views.get_all_mentors, name='users-mentors'),
+    path('users/mentees/', views.get_all_mentees, name='users-mentees'),
     
     # User status management
     path('users/<int:user_id>/activate/', views.activate_user, name='users-activate'),

@@ -3,9 +3,15 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
+
+    path('available-mentors/', views.get_available_mentors, name='available-mentors'),
+    path('ready-mentees/', views.get_ready_mentees, name='ready-mentees'),
+    path('check-eligibility/<int:mentee_id>/', views.check_mentee_eligibility, name='check-eligibility'),
+    path('bulk-actions/', views.bulk_mentorship_actions, name='bulk-actions'),
+
     # Department URLs
     path('departments/', views.list_departments, name='list_departments'),
-    path('departments/<int:department_id>/programs/', views.get_department_programs, name='department_programs'),
+    path('departments/<int:department>/programs/', views.get_department_programs, name='department_programs'),
     
     # Session Template URLs
     path('session-templates/', views.list_session_templates, name='list_session_templates'),

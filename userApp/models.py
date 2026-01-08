@@ -45,7 +45,7 @@ class WorkEmailValidator(EmailValidator):
 
 class CustomUserManager(BaseUserManager):
     def create_user(self, phone_number, email=None, full_name=None, role=None, department=None, 
-                    status='pending', availability_status='inactive', 
+                    departments=None, status='pending', availability_status='inactive', 
                     work_mail_address=None, password=None, created_by=None):
         if not phone_number:
             raise ValueError("The phone number must be provided")
@@ -56,23 +56,37 @@ class CustomUserManager(BaseUserManager):
         if role not in [choice[0] for choice in CustomUser.ROLE_CHOICES]:
             raise ValueError("Invalid role selected")
         
-        # Department validation for non-admin/non-hr users
-        if role not in ['admin', 'hr']:
+        # Department validation based on role
+        from departmentApp.models import Department
+        
+        if role == 'mentee':
+            # Mentees require a single department (ForeignKey)
             if not department:
-                raise ValueError(f"The department must be provided for {role} users")
+                raise ValueError("The department must be provided for mentee users")
             
-            # Import here to avoid circular imports
-            from departmentApp.models import Department
-            
-            # Validate department exists and is active
             if not Department.objects.filter(id=department, status='active').exists():
                 raise ValueError("Invalid or inactive department selected")
+        
+        elif role == 'mentor':
+            # Mentors require departments list (ManyToMany)
+            if not departments or len(departments) == 0:
+                raise ValueError("At least one department must be provided for mentor users")
+            
+            # Validate all departments exist and are active
+            valid_depts = Department.objects.filter(id__in=departments, status='active')
+            if valid_depts.count() != len(departments):
+                raise ValueError("One or more selected departments are invalid or inactive")
+        
+        elif role in ['admin', 'hr']:
+            # Admin and HR don't require departments
+            department = None
+            departments = None
 
         user = self.model(
             phone_number=phone_number,
             full_name=full_name,
             role=role,
-            department_id=department if role != 'mentor' else None,  # Mentors use M2M
+            department_id=department if role == 'mentee' else None,
             status=status,
             availability_status=availability_status
         )
@@ -93,13 +107,8 @@ class CustomUserManager(BaseUserManager):
         user.save(using=self._db)
         
         # For mentors, set departments through M2M after saving
-        if role == 'mentor' and department:
-            from departmentApp.models import Department
-            # If department is a list/queryset, add all; if single ID, add that one
-            if isinstance(department, (list, tuple)):
-                user.departments.set(department)
-            else:
-                user.departments.add(department)
+        if role == 'mentor' and departments:
+            user.departments.set(departments)
         
         return user
 
@@ -120,7 +129,8 @@ class CustomUserManager(BaseUserManager):
             email=email,
             full_name=full_name,
             role='admin',
-            department=None,  # Admin doesn't require department
+            department=None,
+            departments=None,
             status='approved',
             availability_status='active',
             work_mail_address=work_mail,
@@ -163,7 +173,6 @@ class CustomUserManager(BaseUserManager):
             return f"{first_initial}.{last_name}{random_num}@{role_prefix}_btsl_mentorship.com"
         else:
             return f"{full_name.lower().replace(' ', '')}{random_num}@{role_prefix}_btsl_mentorship.com"
-
 
 class CustomUser(AbstractBaseUser, PermissionsMixin):
     ROLE_CHOICES = [

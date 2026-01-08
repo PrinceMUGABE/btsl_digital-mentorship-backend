@@ -230,49 +230,49 @@ class MentorshipCreateSerializer(serializers.Serializer):
         return data
 
 class MentorshipSerializer(serializers.ModelSerializer):
-    """Serializer for mentorships"""
+    """Serializer for department-based mentorships"""
     mentor = UserBasicSerializer(read_only=True)
     mentee = UserBasicSerializer(read_only=True)
-    program = MentorshipProgramSerializer(read_only=True)
-    created_by = UserBasicSerializer(read_only=True)
-    progress_percentage = serializers.SerializerMethodField()
-    remaining_sessions = serializers.SerializerMethodField()
-    duration_days = serializers.SerializerMethodField()
-    is_overdue = serializers.SerializerMethodField()
-    can_schedule = serializers.SerializerMethodField()
-    expected_end_date = serializers.DateField(read_only=True)
+    department = serializers.SerializerMethodField()
+    programs = MentorshipProgramSerializer(many=True, read_only=True)
+    current_program = MentorshipProgramSerializer(read_only=True)
+    
+    # Progress fields
+    overall_progress = serializers.SerializerMethodField()
+    program_progress = serializers.SerializerMethodField()
+    total_programs = serializers.SerializerMethodField()
+    completed_programs_count = serializers.SerializerMethodField()
     
     class Meta:
         model = Mentorship
         fields = [
-            'id', 'mentor', 'mentee', 'program', 'status',
+            'id', 'mentor', 'mentee', 'department',
+            'programs', 'current_program', 'status',
             'start_date', 'expected_end_date', 'actual_end_date',
-            'sessions_completed', 'rating', 'feedback', 'goals',
-            'achievements', 'notes', 'created_at', 'updated_at',
-            'created_by', 'progress_percentage', 'remaining_sessions',
-            'duration_days', 'is_overdue', 'can_schedule'
-        ]
-        read_only_fields = [
-            'id', 'sessions_completed', 'created_at', 'updated_at',
-            'expected_end_date', 'actual_end_date'
+            'sessions_completed', 'total_sessions_required',
+            'overall_progress', 'program_progress',
+            'total_programs', 'completed_programs_count',
+            'rating', 'feedback', 'goals', 'achievements',
+            'notes', 'created_at', 'updated_at'
         ]
     
-    def get_progress_percentage(self, obj):
-        return obj.get_progress_percentage()
+    def get_department(self, obj):
+        return {
+            'id': obj.department.id,
+            'name': obj.department.name
+        }
     
-    def get_remaining_sessions(self, obj):
-        return obj.get_remaining_sessions()
+    def get_overall_progress(self, obj):
+        return obj.get_overall_progress_percentage()
     
-    def get_duration_days(self, obj):
-        return obj.get_duration_days()
+    def get_program_progress(self, obj):
+        return obj.get_program_progress()
     
-    def get_is_overdue(self, obj):
-        return obj.is_overdue()
+    def get_total_programs(self, obj):
+        return obj.programs.count()
     
-    def get_can_schedule(self, obj):
-        return obj.can_schedule_session()
-
-
+    def get_completed_programs_count(self, obj):
+        return obj.completed_programs.count()
 class MentorshipSessionSerializer(serializers.ModelSerializer):
     """Serializer for mentorship sessions"""
     mentorship = MentorshipSerializer(read_only=True)

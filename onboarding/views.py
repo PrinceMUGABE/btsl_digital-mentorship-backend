@@ -309,6 +309,65 @@ from userApp.models import CustomUser
 from departmentApp.models import Department
 
 
+def mark_as_started(self):
+    """Mark module as started"""
+    if not self.started_at:
+        self.started_at = now()
+        self.status = 'in_progress'
+        self.save()
+
+
+def mark_as_completed(self):
+    """Mark module as completed"""
+    if self.status != 'completed':
+        self.status = 'completed'
+        self.progress_percentage = 100
+        self.completed_at = now()
+        self.save()
+
+
+def update_progress(self, percentage):
+    """Update progress percentage"""
+    if 0 <= percentage <= 100:
+        self.progress_percentage = percentage
+        
+        # Auto-start if not started
+        if not self.started_at and percentage > 0:
+            self.started_at = now()
+        
+        # Auto-complete if 100%
+        if percentage == 100:
+            self.status = 'completed'
+            self.completed_at = now()
+        elif percentage > 0:
+            self.status = 'in_progress'
+        
+        self.save()
+
+
+def add_time_spent(self, minutes):
+    """Add time spent on module"""
+    if minutes > 0:
+        self.time_spent_minutes += minutes
+        self.save()
+
+
+def is_overdue(self):
+    """Check if module is overdue"""
+    if self.due_date and self.status != 'completed':
+        return now() > self.due_date
+    return False
+
+
+def get_progress_speed(self):
+    """Calculate progress speed (percentage per day)"""
+    if self.started_at and self.progress_percentage > 0:
+        days_elapsed = (now() - self.started_at).days
+        if days_elapsed > 0:
+            return round(self.progress_percentage / days_elapsed, 2)
+    return 0
+
+
 # ================ NEW DEPARTMENT-FOCUSED VIEWS ================
 
 @api_view(['GET'])
@@ -331,9 +390,9 @@ def get_department_modules_summary(request, department_id=None):
         # Get all active departments
         departments = Department.objects.filter(status='active')
     
-    # If user is mentor, filter to their department only
+    # If user is mentor, filter to their departments only
     if request.user.role == 'mentor':
-        departments = departments.filter(name=request.user.department)
+        departments = departments.filter(id__in=request.user.departments.values_list('id', flat=True))
     
     department_summaries = []
     
@@ -344,22 +403,24 @@ def get_department_modules_summary(request, department_id=None):
             is_active=True
         ).distinct()
         
-        # Get mentees in this department
+        # Get mentees in this department - FIXED: Use ForeignKey relationship
         mentees = CustomUser.objects.filter(
             role='mentee',
-            department=department.name,
+            department=department,  # ForeignKey relationship
             status='approved'
         )
         
         # Calculate statistics
         total_mentees = mentees.count()
+        
+        # FIXED: Use ForeignKey relationship
         total_modules_assigned = MenteeOnboardingProgress.objects.filter(
-            mentee__department=department.name
+            mentee__department=department
         ).count()
         
         # Calculate completion statistics
         completed_modules = MenteeOnboardingProgress.objects.filter(
-            mentee__department=department.name,
+            mentee__department=department,
             status='completed'
         ).count()
         
@@ -370,7 +431,7 @@ def get_department_modules_summary(request, department_id=None):
         # Calculate average progress per mentee
         if total_mentees > 0:
             avg_progress = MenteeOnboardingProgress.objects.filter(
-                mentee__department=department.name
+                mentee__department=department
             ).aggregate(
                 avg=Avg('progress_percentage')
             )['avg'] or 0
@@ -380,7 +441,7 @@ def get_department_modules_summary(request, department_id=None):
         # Count mentees behind schedule
         mentees_behind_schedule = CustomUser.objects.filter(
             role='mentee',
-            department=department.name,
+            department=department,
             status='approved',
             onboarding_progress__status__in=['overdue', 'off_track', 'needs_attention']
         ).distinct().count()
@@ -390,7 +451,7 @@ def get_department_modules_summary(request, department_id=None):
             Q(module_type='core') | Q(departments=department),
             is_active=True,
             mentee_progress__status__in=['overdue', 'off_track'],
-            mentee_progress__mentee__department=department.name
+            mentee_progress__mentee__department=department
         ).values_list('title', flat=True).distinct()[:5]
         
         department_summaries.append({
@@ -418,22 +479,24 @@ def get_department_progress_detail(request, department_id):
     department = get_object_or_404(Department, id=department_id)
     
     # Check permissions
-    if request.user.role == 'mentor' and department.name != request.user.department:
-        return Response(
-            {'error': 'You can only view progress for your own department'},
-            status=status.HTTP_403_FORBIDDEN
-        )
+    if request.user.role == 'mentor':
+        # Check if mentor has access to this department
+        if not request.user.departments.filter(id=department.id).exists():
+            return Response(
+                {'error': 'You can only view progress for your assigned departments'},
+                status=status.HTTP_403_FORBIDDEN
+            )
     
-    # Get mentees in this department
+    # Get mentees in this department - FIXED: Use ForeignKey
     mentees = CustomUser.objects.filter(
         role='mentee',
-        department=department.name,
+        department=department,
         status='approved'
     )
     
     # Get all progress records for this department
     progress_records = MenteeOnboardingProgress.objects.filter(
-        mentee__department=department.name
+        mentee__department=department
     ).select_related('mentee', 'module')
     
     # Group by mentee
@@ -514,6 +577,7 @@ def get_department_progress_detail(request, department_id):
     })
 
 
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_modules_by_department(request):
@@ -538,16 +602,18 @@ def get_modules_by_department(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
     else:
-        # If no department filter, show all modules
+        # If no department filter, show appropriate modules based on role
         if user.role == 'mentee':
             # For mentees, show modules for their department
-            queryset = queryset.filter(
-                Q(module_type='core') | Q(departments__name=user.department)
-            ).distinct()
+            if user.department:
+                queryset = queryset.filter(
+                    Q(module_type='core') | Q(departments=user.department)
+                ).distinct()
         elif user.role == 'mentor':
-            # For mentors, show modules for their department
+            # For mentors, show modules for their departments
+            mentor_dept_ids = user.departments.values_list('id', flat=True)
             queryset = queryset.filter(
-                Q(module_type='core') | Q(departments__name=user.department)
+                Q(module_type='core') | Q(departments__id__in=mentor_dept_ids)
             ).distinct()
     
     # Apply additional filters
@@ -580,6 +646,15 @@ def assign_module_to_department(request, pk):
             status=status.HTTP_400_BAD_REQUEST
         )
     
+    # Validate department IDs
+    try:
+        department_ids = [int(id) for id in department_ids]
+    except (ValueError, TypeError):
+        return Response(
+            {'error': 'Invalid department IDs. Must be integers.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
     departments = Department.objects.filter(id__in=department_ids, status='active')
     if not departments.exists():
         return Response(
@@ -592,10 +667,10 @@ def assign_module_to_department(request, pk):
     
     with transaction.atomic():
         for department in departments:
-            # Get all approved mentees in this department
+            # FIXED: Use ForeignKey relationship instead of department.name
             mentees = CustomUser.objects.filter(
                 role='mentee',
-                department=department.name,
+                department=department,  # ✅ Use department object, not department.name
                 status='approved'
             )
             
@@ -630,19 +705,19 @@ def assign_module_to_department(request, pk):
                     # Send notification
                     title = f"New Onboarding Module Assigned: {module.title}"
                     message = f"""
-                    Hello {mentee.full_name},
-                    
-                    A new onboarding module has been assigned to your department:
-                    
-                    Module: {module.title}
-                    Department: {department.name}
-                    Description: {module.description[:200]}...
-                    
-                    Please log in to start this module.
-                    
-                    Best regards,
-                    Mentorship Program Team
-                    """
+Hello {mentee.full_name},
+
+A new onboarding module has been assigned to your department:
+
+Module: {module.title}
+Department: {department.name}
+Description: {module.description[:200]}...
+
+Please log in to start this module.
+
+Best regards,
+Mentorship Program Team
+"""
                     
                     send_onboarding_notification(
                         recipient=mentee,
@@ -663,7 +738,6 @@ def assign_module_to_department(request, pk):
         'departments_assigned': [dept.name for dept in departments],
         'errors': errors if errors else None
     })
-
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -830,13 +904,15 @@ def get_department_module_performance(request, module_id):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_onboarding_modules(request):
+
     """
     Get all active onboarding modules with department support
+    Mentees can see BOTH core modules AND their department-specific modules
     """
     user = request.user
     queryset = OnboardingModule.objects.filter(is_active=True)
     
-    # Filter by specific departments if provided
+    # Filter by specific departments if provided (admin/HR use case)
     department_ids = request.query_params.getlist('department_ids[]')
     if department_ids:
         try:
@@ -850,25 +926,35 @@ def get_onboarding_modules(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
     
-    # Filter by module type
+    # Filter by module type if specified
     module_type = request.query_params.get('module_type')
     if module_type:
         queryset = queryset.filter(module_type=module_type)
     
-    # For mentors, show only modules for their department
+    # Role-based filtering
     if user.role == 'mentor':
+        # Mentors see modules for their departments
+        mentor_dept_ids = user.departments.values_list('id', flat=True)
         queryset = queryset.filter(
-            Q(module_type='core') | Q(departments__name=user.department)
+            Q(module_type='core') | Q(departments__id__in=mentor_dept_ids)
         ).distinct()
     
-    # For mentees, show only applicable modules
     elif user.role == 'mentee':
-        queryset = queryset.filter(
-            Q(module_type='core') | Q(departments__name=user.department)
-        ).distinct()
+        # FIXED: Mentees see BOTH core modules AND their department modules
+        if user.department:
+            queryset = queryset.filter(
+                Q(module_type='core') | Q(departments=user.department)
+            ).distinct()
+        else:
+            # If mentee has no department, show only core modules
+            queryset = queryset.filter(module_type='core')
+    
+    # Admin/HR see all modules (no filtering needed)
     
     serializer = OnboardingModuleSerializer(queryset, many=True)
     return Response(serializer.data)
+
+
 
 
 @api_view(['POST'])
@@ -974,38 +1060,54 @@ def auto_assign_modules(request):
 @permission_classes([IsAuthenticated])
 def get_department_modules(request):
     """
-    Get modules for current user's department (updated for multiple departments)
+    Get modules for current user's department (updated for ForeignKey)
+    Mentees can access BOTH core and department-specific modules
     """
     user = request.user
     
     if user.role == 'mentee':
-        # For mentees, show modules for their department
-        queryset = OnboardingModule.objects.filter(
-            Q(module_type='core') | Q(departments__name=user.department),
-            is_active=True
-        ).distinct()
-    elif user.role == 'mentor':
-        # For mentors, show modules for their department
-        queryset = OnboardingModule.objects.filter(
-            Q(module_type='core') | Q(departments__name=user.department),
-            is_active=True
-        ).distinct()
-    else:
-        # Admin/HR can specify department
-        department_name = request.query_params.get('department')
-        if department_name:
+        # FIXED: For mentees, show BOTH core AND department modules
+        if user.department:
             queryset = OnboardingModule.objects.filter(
-                Q(module_type='core') | Q(departments__name=department_name),
+                Q(module_type='core') | Q(departments=user.department),
                 is_active=True
             ).distinct()
+        else:
+            # If no department, show only core modules
+            queryset = OnboardingModule.objects.filter(
+                module_type='core',
+                is_active=True
+            )
+    
+    elif user.role == 'mentor':
+        # For mentors, show modules for their departments
+        mentor_dept_ids = user.departments.values_list('id', flat=True)
+        queryset = OnboardingModule.objects.filter(
+            Q(module_type='core') | Q(departments__id__in=mentor_dept_ids),
+            is_active=True
+        ).distinct()
+    
+    else:
+        # Admin/HR can specify department by ID
+        department_id = request.query_params.get('department_id')
+        if department_id:
+            try:
+                department = Department.objects.get(id=int(department_id))
+                queryset = OnboardingModule.objects.filter(
+                    Q(module_type='core') | Q(departments=department),
+                    is_active=True
+                ).distinct()
+            except (Department.DoesNotExist, ValueError):
+                return Response(
+                    {'error': 'Invalid department ID'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
         else:
             # Show all modules
             queryset = OnboardingModule.objects.filter(is_active=True)
     
     serializer = OnboardingModuleSerializer(queryset, many=True)
     return Response(serializer.data)
-
-
 
 
 # ================ ONBOARDING MODULE VIEWS ================
@@ -1335,6 +1437,7 @@ def get_module_mentee_progress(request, pk):
 def get_mentee_progress(request):
     """
     Get onboarding progress based on user role
+    Mentees can see their progress on BOTH core and department modules
     """
     user = request.user
     
@@ -1348,9 +1451,10 @@ def get_mentee_progress(request):
             queryset = queryset.filter(mentee_id=mentee_id)
     
     elif user.role == 'mentor':
-        # Mentors can see progress of mentees in their department
+        # FIXED: Mentors can see progress of mentees in their departments
+        mentor_dept_ids = user.departments.values_list('id', flat=True)
         queryset = MenteeOnboardingProgress.objects.filter(
-            mentee__department=user.department
+            mentee__department__id__in=mentor_dept_ids
         )
         
         # Filter by specific mentee if provided
@@ -1359,7 +1463,8 @@ def get_mentee_progress(request):
             queryset = queryset.filter(mentee_id=mentee_id)
     
     elif user.role == 'mentee':
-        # Mentees can only see their own progress
+        # FIXED: Mentees see their own progress on ALL assigned modules
+        # This includes both core and department-specific modules
         queryset = MenteeOnboardingProgress.objects.filter(mentee=user)
     
     else:
@@ -1381,7 +1486,6 @@ def get_mentee_progress(request):
     serializer = MenteeOnboardingProgressSerializer(queryset, many=True)
     
     return Response(serializer.data)
-
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -1837,7 +1941,8 @@ def get_all_mentees_summary(request):
 @permission_classes([IsAuthenticated])
 def auto_assign_modules(request):
     """
-    Automatically assign appropriate modules to a mentee
+    Automatically assign appropriate modules to a mentee based on their department
+    Assigns BOTH core modules AND department-specific modules
     """
     if request.user.role not in ['admin', 'hr']:
         return Response(
@@ -1860,11 +1965,18 @@ def auto_assign_modules(request):
             status=status.HTTP_404_NOT_FOUND
         )
     
-    # Get core modules and department-specific modules
-    modules = OnboardingModule.objects.filter(
-        Q(module_type='core') | Q(department=mentee.department),
-        is_active=True
-    )
+    # FIXED: Get BOTH core modules AND department-specific modules
+    if mentee.department:
+        modules = OnboardingModule.objects.filter(
+            Q(module_type='core') | Q(departments=mentee.department),
+            is_active=True
+        ).distinct()
+    else:
+        # If no department, assign only core modules
+        modules = OnboardingModule.objects.filter(
+            module_type='core',
+            is_active=True
+        )
     
     assigned_count = 0
     assigned_modules = []
@@ -1900,61 +2012,37 @@ def auto_assign_modules(request):
                     'type': module.module_type
                 })
     
-    # Send notification to mentee
+    # Send notification
     if assigned_count > 0:
         title = "Onboarding Modules Assigned"
-        module_list = "\n".join([f"- {module['title']}" for module in assigned_modules])
+        module_list = "\n".join([f"- {module['title']} ({module['type']})" for module in assigned_modules])
+        
+        dept_name = mentee.department.name if mentee.department else "No Department"
         
         message = f"""
-        Hello {mentee.full_name},
-        
-        {assigned_count} onboarding modules have been automatically assigned to you:
-        
-        {module_list}
-        
-        Please log in to the mentorship portal to start your onboarding journey.
-        
-        Best regards,
-        Mentorship Program Team
+Hello {mentee.full_name},
+
+{assigned_count} onboarding modules have been automatically assigned to you.
+
+Department: {dept_name}
+
+Assigned Modules:
+{module_list}
+
+These include both core modules (required for all mentees) and department-specific modules.
+
+Please log in to the mentorship portal to start your onboarding journey.
+
+Best regards,
+Mentorship Program Team
         """
         
         send_onboarding_notification(
             recipient=mentee,
             notification_type='module_assigned',
             title=title,
-            message=message,
-            related_module=None
+            message=message
         )
-        
-        # Send notification to mentors
-        mentors = CustomUser.objects.filter(
-            role='mentor',
-            department=mentee.department,
-            status='approved'
-        )
-        
-        for mentor in mentors:
-            mentor_title = f"New Mentee Assigned: {mentee.full_name}"
-            mentor_message = f"""
-            Mentor Notification:
-            
-            {assigned_count} onboarding modules have been automatically assigned to your new mentee:
-            
-            Mentee: {mentee.full_name}
-            Department: {mentee.department}
-            
-            Please welcome them and guide them through the onboarding process.
-            
-            Best regards,
-            Mentorship Program Team
-            """
-            
-            send_onboarding_notification(
-                recipient=mentor,
-                notification_type='module_assigned',
-                title=mentor_title,
-                message=mentor_message
-            )
     
     return Response({
         'message': f'Auto-assigned {assigned_count} modules to {mentee.full_name}',
@@ -1963,10 +2051,9 @@ def auto_assign_modules(request):
         'mentee': {
             'id': mentee.id,
             'name': mentee.full_name,
-            'department': mentee.department
+            'department': mentee.department.name if mentee.department else None
         }
     })
-
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])

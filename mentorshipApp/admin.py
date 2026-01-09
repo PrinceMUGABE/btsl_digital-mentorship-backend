@@ -1,4 +1,4 @@
-# mentorshipApp/admin.py - Complete corrected version
+# mentorshipApp/admin.py - Fixed version
 
 from django.contrib import admin
 from django.utils.html import format_html
@@ -89,13 +89,13 @@ class MentorshipSessionInline(admin.TabularInline):
     model = MentorshipSession
     extra = 0
     fields = [
-        'session_number',
+        'program_session_number',  # Changed from 'session_number'
         'session_template',
         'status',
         'scheduled_date',
         'duration_minutes'
     ]
-    readonly_fields = ['session_number']
+    readonly_fields = ['program_session_number']  # Changed from 'session_number'
     can_delete = False
     show_change_link = True
 
@@ -108,20 +108,19 @@ class MentorshipAdmin(admin.ModelAdmin):
         'program_display',
         'status_display',
         'start_date_display',
-        'sessions_completed',
+        'sessions_completed_display',
         'remaining_sessions_display',
         'rating_display',
         'created_at_display'
     ]
-    # FIX: Changed 'program__name' to 'current_program__name'
     list_filter = ['status', 'current_program__name', 'start_date']
     search_fields = [
         'mentor__full_name',
         'mentee__full_name',
-        'current_program__name'  # Also fix this search field
+        'current_program__name'
     ]
     readonly_fields = [
-        'sessions_completed',
+        'sessions_completed_display',
         'expected_end_date',
         'progress_percentage',
         'remaining_sessions',
@@ -132,7 +131,7 @@ class MentorshipAdmin(admin.ModelAdmin):
     
     fieldsets = (
         ('Participants', {
-            'fields': ('mentor', 'mentee', 'current_program')  # Changed 'program' to 'current_program'
+            'fields': ('mentor', 'mentee', 'current_program')
         }),
         ('Status & Progress', {
             'fields': (
@@ -140,7 +139,7 @@ class MentorshipAdmin(admin.ModelAdmin):
                 'start_date',
                 'expected_end_date',
                 'actual_end_date',
-                'sessions_completed',
+                'sessions_completed_display',
                 'progress_percentage',
                 'remaining_sessions',
                 'rating'
@@ -166,7 +165,6 @@ class MentorshipAdmin(admin.ModelAdmin):
     mentee_info.short_description = 'Mentee'
     
     def program_display(self, obj):
-        # FIX: Changed to current_program
         return obj.current_program.name if obj.current_program else '-'
     program_display.short_description = 'Current Program'
     
@@ -190,8 +188,19 @@ class MentorshipAdmin(admin.ModelAdmin):
         return obj.start_date.strftime('%Y-%m-%d') if obj.start_date else '-'
     start_date_display.short_description = 'Start Date'
     
+    def sessions_completed_display(self, obj):
+        completed = obj.get_sessions_completed()
+        return format_html(
+            '<span style="color: {}; font-weight: bold;">{}</span>',
+            'green' if completed > 0 else 'gray',
+            completed
+        )
+    sessions_completed_display.short_description = 'Sessions Completed'
+    
     def remaining_sessions_display(self, obj):
-        remaining = obj.get_remaining_sessions()
+        total = obj.get_total_sessions()
+        completed = obj.get_sessions_completed()
+        remaining = total - completed if total > completed else 0
         color = 'red' if remaining > 0 else 'green'
         return format_html(
             '<span style="color: {}; font-weight: bold;">{}</span>',
@@ -223,19 +232,27 @@ class MentorshipAdmin(admin.ModelAdmin):
     progress_percentage.short_description = 'Progress %'
     
     def remaining_sessions(self, obj):
-        return obj.get_remaining_sessions()
+        total = obj.get_total_sessions()
+        completed = obj.get_sessions_completed()
+        remaining = total - completed if total > completed else 0
+        return format_html(
+            '<span style="color: {}; font-weight: bold;">{}</span>',
+            'red' if remaining > 0 else 'green',
+            remaining
+        )
     remaining_sessions.short_description = 'Remaining Sessions'
     
     def get_queryset(self, request):
         return super().get_queryset(request).select_related(
-            'mentor', 'mentee', 'current_program', 'created_by'  # Changed 'program' to 'current_program'
+            'mentor', 'mentee', 'current_program', 'created_by'
         )
+    
 
 @admin.register(MentorshipSession)
 class MentorshipSessionAdmin(admin.ModelAdmin):
     list_display = [
         'mentorship_display',
-        'session_number',
+        'program_session_number',  # Changed from 'session_number'
         'session_template_display',
         'status_display',
         'scheduled_date_display',
@@ -253,7 +270,9 @@ class MentorshipSessionAdmin(admin.ModelAdmin):
         'created_at_display', 
         'updated_at_display', 
         'actual_date_display',
-        'completed_by_display'
+        'completed_by_display',
+        'program_session_number',  # Added as readonly
+        'overall_session_number'   # Added as readonly
     ]
     autocomplete_fields = ['session_template', 'mentorship']
     
@@ -261,7 +280,8 @@ class MentorshipSessionAdmin(admin.ModelAdmin):
         ('Session Information', {
             'fields': (
                 'mentorship',
-                'session_number',
+                'program_session_number',
+                'overall_session_number',
                 'session_template',
                 'status'
             )
@@ -276,7 +296,7 @@ class MentorshipSessionAdmin(admin.ModelAdmin):
             )
         }),
         ('Session Details', {
-            'fields': ('agenda', 'objectives', 'requirements', 'notes', 'action_items')
+            'fields': ('agenda', 'objectives', 'notes', 'action_items')
         }),
         ('Feedback & Completion', {
             'fields': (

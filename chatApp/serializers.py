@@ -6,7 +6,7 @@ from .models import (
     GroupMessageReadStatus
 )
 from userApp.models import CustomUser
-from mentoshipApp.models import Mentorship
+from mentorshipApp.models import Mentorship
 
 
 class UserBasicSerializer(serializers.ModelSerializer):

@@ -33,7 +33,7 @@ INSTALLED_APPS = [
     'channels',
     'userApp',
     'onboarding',
-    'mentoshipApp',
+    'mentorshipApp',
     'departmentApp',
     'chatApp',
     'notificationApp',

@@ -3,7 +3,7 @@ from django.utils.timezone import now
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.db.models import Count, Q
 from userApp.models import CustomUser
-from mentoshipApp.models import Mentorship
+from mentorshipApp.models import Mentorship
 
 
 class ChatType(models.TextChoices):
@@ -190,7 +190,18 @@ class GroupChatRoom(models.Model):
     @property
     def participants(self):
         """Get all participants for this chat room"""
-        return CustomUser.objects.filter(groupchatparticipant__chat_room=self)
+        return CustomUser.objects.filter(group_chat_participations__chat_room=self)
+    
+    def has_participant(self, user):
+        """Check if user is a participant in this group chat"""
+        return self.chat_participants.filter(user=user).exists()
+    
+    def get_participant(self, user):
+        """Get the participant object for a user"""
+        try:
+            return self.chat_participants.get(user=user)
+        except GroupChatParticipant.DoesNotExist:
+            return None
     
     def add_participant(self, user, added_by=None, role='member'):
         """Add a participant to the group chat"""
@@ -222,8 +233,23 @@ class GroupChatRoom(models.Model):
             return participant.role in ['admin', 'moderator']
         except GroupChatParticipant.DoesNotExist:
             return False
-
-
+    
+    def get_participant_count(self):
+        """Get total number of participants"""
+        return self.chat_participants.count()
+    
+    def get_unread_count_for_user(self, user):
+        """Get unread message count for a specific user"""
+        participant = self.get_participant(user)
+        if not participant:
+            return 0
+        
+        last_read = participant.last_read_at or participant.joined_at
+        return self.group_messages.filter(
+            created_at__gt=last_read,
+            is_deleted=False
+        ).exclude(sender=user).count()
+    
 class GroupChatParticipant(models.Model):
     """Track participants in group chats with roles"""
     ROLE_CHOICES = [

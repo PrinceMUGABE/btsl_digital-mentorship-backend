@@ -1,4 +1,4 @@
-# mentoshipApp/apps.py
+# chatApp/apps.py
 from django.apps import AppConfig
 
 

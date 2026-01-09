@@ -1,7 +1,7 @@
 from django.db import models
 from django.utils.timezone import now
 from userApp.models import CustomUser
-from mentoshipApp.models import Mentorship
+from mentorshipApp.models import Mentorship
 from chatApp.models import ChatRoom, GroupChatRoom
 
 
